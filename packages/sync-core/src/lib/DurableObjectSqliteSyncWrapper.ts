@@ -5,6 +5,7 @@ import {
 	type TLSyncSqliteWrapper,
 	type TLSyncSqliteWrapperConfig,
 } from './SQLiteSyncStorage'
+import { withSyncSpan } from './otel'
 
 /**
  * Mimics a prepared statement interface for Durable Objects SQLite.
@@ -25,16 +26,47 @@ class DurableObjectStatement<
 	) {}
 
 	iterate(...bindings: TParams): IterableIterator<TResult> {
-		const result = this.sql.exec(this.query, ...bindings)
-		return result[Symbol.iterator]() as IterableIterator<TResult>
+		return withSyncSpan(
+			'tlsync.storage.sqlite.statement.iterate',
+			{
+				attributes: {
+					'db.system': 'sqlite',
+					'db.operation': 'iterate',
+				},
+			},
+			() => {
+				const result = this.sql.exec(this.query, ...bindings)
+				return result[Symbol.iterator]() as IterableIterator<TResult>
+			}
+		)
 	}
 
 	all(...bindings: TParams): TResult[] {
-		return this.sql.exec(this.query, ...bindings).toArray()
+		return withSyncSpan(
+			'tlsync.storage.sqlite.statement.all',
+			{
+				attributes: {
+					'db.system': 'sqlite',
+					'db.operation': 'all',
+				},
+			},
+			() => this.sql.exec(this.query, ...bindings).toArray()
+		)
 	}
 
 	run(...bindings: TParams): void {
-		this.sql.exec(this.query, ...bindings)
+		withSyncSpan(
+			'tlsync.storage.sqlite.statement.run',
+			{
+				attributes: {
+					'db.system': 'sqlite',
+					'db.operation': 'run',
+				},
+			},
+			() => {
+				this.sql.exec(this.query, ...bindings)
+			}
+		)
 	}
 }
 
@@ -80,7 +112,18 @@ export class DurableObjectSqliteSyncWrapper implements TLSyncSqliteWrapper {
 	) {}
 
 	exec(sql: string): void {
-		this.storage.sql.exec(sql)
+		withSyncSpan(
+			'tlsync.storage.sqlite.exec',
+			{
+				attributes: {
+					'db.system': 'sqlite',
+					'db.operation': 'exec',
+				},
+			},
+			() => {
+				this.storage.sql.exec(sql)
+			}
+		)
 	}
 
 	prepare<TResult extends TLSqliteRow | void = void, TParams extends TLSqliteInputValue[] = []>(
@@ -90,6 +133,15 @@ export class DurableObjectSqliteSyncWrapper implements TLSyncSqliteWrapper {
 	}
 
 	transaction<T>(callback: () => T): T {
-		return this.storage.transactionSync(callback)
+		return withSyncSpan(
+			'tlsync.storage.sqlite.transaction.wrapper',
+			{
+				attributes: {
+					'db.system': 'sqlite',
+					'db.operation': 'transaction',
+				},
+			},
+			() => this.storage.transactionSync(callback)
+		)
 	}
 }

@@ -31,6 +31,8 @@ import {
 	TLSocketServerSentEvent,
 	getTlsyncProtocolVersion,
 } from './protocol'
+import { attachTraceCarrier, extractTraceContext, setSafeAttributes, withSyncSpan } from './otel'
+import { summarizeNetworkDiff } from './shapeTelemetry'
 
 /**
  * Function type for subscribing to events with a callback.
@@ -304,6 +306,14 @@ function getPresenceOp<R extends UnknownRecord>(
 	return undefined
 }
 
+function summarizeRecordDiff(diff: RecordsDiff<UnknownRecord>) {
+	return {
+		'tldraw.diff.added': Object.keys(diff.added).length,
+		'tldraw.diff.updated': Object.keys(diff.updated).length,
+		'tldraw.diff.removed': Object.keys(diff.removed).length,
+	}
+}
+
 /**
  * Main client-side synchronization engine for collaborative tldraw applications.
  *
@@ -451,7 +461,18 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 		}
 	}
 
+	private getTelemetryAttributes(additional?: Record<string, string | number | boolean>) {
+		return {
+			...this.telemetryContext,
+			...additional,
+		}
+	}
+
 	private readonly presenceType: R['typeName'] | null
+
+	private readonly telemetryContext:
+		| Record<string, string | number | boolean | undefined>
+		| undefined
 
 	private didCancel?: () => boolean
 
@@ -481,8 +502,10 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 		onCustomMessageReceived?: TLCustomMessageHandler
 		onAfterConnect?(self: TLSyncClient<R, S>, details: { isReadonly: boolean }): void
 		didCancel?(): boolean
+		telemetryContext?: Record<string, string | number | boolean | undefined>
 	}) {
 		this.didCancel = config.didCancel
+		this.telemetryContext = config.telemetryContext
 
 		this.presenceType = config.store.scopedTypes.presence.values().next().value ?? null
 
@@ -513,15 +536,31 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 				return
 			}
 
-			const pushRequest: TLPushRequest<R> = {
-				type: 'push',
-				clientClock: this.clientClock,
-				diff,
-				presence,
-			}
-
-			this.debug('sending push request', pushRequest)
-			this.socket.sendMessage(pushRequest)
+			const pushRequest: TLPushRequest<R> = withSyncSpan(
+				'tlsync.client.push',
+				{
+					attributes: this.getTelemetryAttributes({
+						'tldraw.client.clock': this.clientClock,
+						'tldraw.msg.type': 'push',
+						'tldraw.has_presence': !!presence,
+						...summarizeNetworkDiff(diff),
+					}),
+				},
+				(span) => {
+					if (diff) {
+						setSafeAttributes(span, summarizeNetworkDiff(diff))
+					}
+					const tracedPushRequest = attachTraceCarrier({
+						type: 'push',
+						clientClock: this.clientClock,
+						diff,
+						presence,
+					})
+					this.debug('sending push request', tracedPushRequest)
+					this.socket.sendMessage(tracedPushRequest)
+					return tracedPushRequest
+				}
+			)
 
 			if (this.unsentChanges.nextPresence) {
 				this.lastPushedPresenceState = this.unsentChanges.nextPresence
@@ -554,7 +593,18 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 				({ changes }) => {
 					if (this.didCancel?.()) return this.close()
 					this.debug('received store changes', { changes })
-					this.push(changes)
+					withSyncSpan(
+						'tlsync.client.store_changes',
+						{
+							attributes: this.getTelemetryAttributes({
+								'tldraw.msg.type': 'push',
+								...summarizeRecordDiff(changes as RecordsDiff<UnknownRecord>),
+							}),
+						},
+						() => {
+							this.push(changes)
+						}
+					)
 				},
 				{ source: 'user', scope: 'document' }
 			),
@@ -592,7 +642,7 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 				this.debug('ping loop', { isConnectedToRoom: this.isConnectedToRoom })
 				if (!this.isConnectedToRoom) return
 				try {
-					this.socket.sendMessage({ type: 'ping' })
+					this.socket.sendMessage(attachTraceCarrier({ type: 'ping' }))
 				} catch (error) {
 					console.warn('ping failed, resetting', error)
 					this.resetConnection()
@@ -652,13 +702,26 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 		}
 		this.debug('sending connect message')
 		this.latestConnectRequestId = uniqueId()
-		this.socket.sendMessage({
-			type: 'connect',
-			connectRequestId: this.latestConnectRequestId,
-			schema: this.store.schema.serialize(),
-			protocolVersion: getTlsyncProtocolVersion(),
-			lastServerClock: this.lastServerClock,
-		})
+		withSyncSpan(
+			'tlsync.client.connect',
+			{
+				attributes: this.getTelemetryAttributes({
+					'tldraw.msg.type': 'connect',
+					'tldraw.client.last_server_clock': this.lastServerClock,
+				}),
+			},
+			() => {
+				this.socket.sendMessage(
+					attachTraceCarrier({
+						type: 'connect',
+						connectRequestId: this.latestConnectRequestId!,
+						schema: this.store.schema.serialize(),
+						protocolVersion: getTlsyncProtocolVersion(),
+						lastServerClock: this.lastServerClock,
+					})
+				)
+			}
+		)
 	}
 
 	/** Switch to offline mode */
@@ -772,40 +835,52 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 
 	/** Handle events received from the server */
 	private handleServerEvent(event: TLSocketServerSentEvent<R>) {
-		this.debug('received server event', event)
-		this.lastServerInteractionTimestamp = Date.now()
-		// always update the lastServerClock when it is present
-		switch (event.type) {
-			case 'connect':
-				this.didReconnect(event)
-				break
-			// legacy v4 events
-			case 'patch':
-			case 'push_result':
-				if (!this.isConnectedToRoom) break
-				this.incomingDiffBuffer.push(event)
-				this.scheduleRebase()
-				break
-			case 'data':
-				// wait for a connect to succeed before processing more events
-				if (!this.isConnectedToRoom) break
-				this.incomingDiffBuffer.push(...event.data)
-				this.scheduleRebase()
-				break
-			case 'incompatibility_error':
-				// legacy unrecoverable errors
-				console.error('incompatibility error is legacy and should no longer be sent by the server')
-				break
-			case 'pong':
-				// noop, we only use ping/pong to set lastSeverInteractionTimestamp
-				break
-			case 'custom':
-				this.onCustomMessageReceived?.call(null, event.data)
-				break
+		const parentContext = extractTraceContext(event.trace)
+		return withSyncSpan(
+			'tlsync.client.receive',
+			{
+				attributes: this.getTelemetryAttributes({
+					'tldraw.msg.type': event.type,
+				}),
+			},
+			() => {
+				this.debug('received server event', event)
+				this.lastServerInteractionTimestamp = Date.now()
+				// always update the lastServerClock when it is present
+				switch (event.type) {
+					case 'connect':
+						this.didReconnect(event)
+						break
+					// legacy v4 events
+					case 'patch':
+					case 'push_result':
+						if (!this.isConnectedToRoom) break
+						this.incomingDiffBuffer.push(event)
+						this.scheduleRebase()
+						break
+					case 'data':
+						// wait for a connect to succeed before processing more events
+						if (!this.isConnectedToRoom) break
+						this.incomingDiffBuffer.push(...event.data)
+						this.scheduleRebase()
+						break
+					case 'incompatibility_error':
+						// legacy unrecoverable errors
+						console.error('incompatibility error is legacy and should no longer be sent by the server')
+						break
+					case 'pong':
+						// noop, we only use ping/pong to set lastSeverInteractionTimestamp
+						break
+					case 'custom':
+						this.onCustomMessageReceived?.call(null, event.data)
+						break
 
-			default:
-				exhaustiveSwitchError(event)
-		}
+					default:
+						exhaustiveSwitchError(event)
+				}
+			},
+			parentContext
+		)
 	}
 
 	/**

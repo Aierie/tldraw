@@ -2,6 +2,7 @@ import { atom, Atom } from '@tldraw/state'
 import { TLRecord } from '@tldraw/tlschema'
 import { assert, warnOnce } from '@tldraw/utils'
 import { chunk } from './chunk'
+import { attachTraceCarrier, extractTraceContext, withSyncSpan } from './otel'
 import { TLSocketClientSentEvent, TLSocketServerSentEvent } from './protocol'
 import {
 	TLPersistentClientSocket,
@@ -213,7 +214,20 @@ export class ClientWebSocketAdapter
 				"sockets must only be orphaned when they are CLOSING or CLOSED, so they can't receive messages"
 			)
 			const parsed = JSON.parse(ev.data.toString())
-			this.messageListeners.forEach((cb) => cb(parsed))
+			const parentContext = extractTraceContext(parsed?.trace)
+			withSyncSpan(
+				'tlsync.socket.client.receive',
+				{
+					attributes: {
+						'tldraw.msg.type': parsed?.type ?? 'unknown',
+						'tldraw.msg.bytes': String(ev.data).length,
+					},
+				},
+				() => {
+					this.messageListeners.forEach((cb) => cb(parsed))
+				},
+				parentContext
+			)
 		}
 
 		this._ws = ws
@@ -265,10 +279,24 @@ export class ClientWebSocketAdapter
 
 		if (!this._ws) return
 		if (this.connectionStatus === 'online') {
-			const chunks = chunk(JSON.stringify(msg))
-			for (const part of chunks) {
-				this._ws.send(part)
-			}
+			withSyncSpan(
+				'tlsync.socket.client.send',
+				{
+					attributes: {
+						'tldraw.msg.type': msg.type,
+					},
+				},
+				(span) => {
+					const tracedMessage = msg.trace ? msg : attachTraceCarrier(msg)
+					const payload = JSON.stringify(tracedMessage)
+					const chunks = chunk(payload)
+					span.setAttribute('tldraw.msg.bytes', payload.length)
+					span.setAttribute('tldraw.msg.chunks', chunks.length)
+					for (const part of chunks) {
+						this._ws!.send(part)
+					}
+				}
+			)
 		} else {
 			console.warn('Tried to send message while ' + this.connectionStatus)
 		}

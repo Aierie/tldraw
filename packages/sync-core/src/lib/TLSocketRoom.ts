@@ -12,7 +12,8 @@ import {
 	TLSyncStorage,
 } from './TLSyncStorage'
 import { JsonChunkAssembler } from './chunk'
-import { TLSocketServerSentEvent } from './protocol'
+import { extractTraceContext, withSyncSpan } from './otel'
+import { TLSocketClientSentEvent, TLSocketServerSentEvent } from './protocol'
 
 /**
  * Logging interface for TLSocketRoom operations. Provides optional methods
@@ -348,20 +349,37 @@ export class TLSocketRoom<R extends UnknownRecord = UnknownRecord, SessionMeta =
 				return
 			}
 			if ('data' in res) {
-				// need to do this first in case the session gets removed as a result of handling the message
-				if (this.opts.onAfterReceiveMessage) {
-					const session = this.room.sessions.get(sessionId)
-					if (session) {
-						this.opts.onAfterReceiveMessage({
-							sessionId,
-							message: res.data as any,
-							stringified: res.stringified,
-							meta: session.meta,
-						})
-					}
-				}
+				const clientMessage = res.data as TLSocketClientSentEvent<R>
+				const parentContext = extractTraceContext(clientMessage.trace)
+				void withSyncSpan(
+					'tlsync.socket.server.receive',
+					{
+						attributes: {
+							'tldraw.msg.type': clientMessage.type,
+							'tldraw.msg.bytes': res.stringified.length,
+						},
+					},
+					() => {
+						// need to do this first in case the session gets removed as a result of handling the message
+						if (this.opts.onAfterReceiveMessage) {
+							const session = this.room.sessions.get(sessionId)
+							if (session) {
+								this.opts.onAfterReceiveMessage({
+									sessionId,
+									message: res.data as any,
+									stringified: res.stringified,
+									meta: session.meta,
+								})
+							}
+						}
 
-				this.room.handleMessage(sessionId, res.data as any)
+						return this.room.handleMessage(sessionId, clientMessage)
+					},
+					parentContext
+				).catch((error) => {
+					this.log?.error?.(error)
+					this.room.rejectSession(sessionId, TLSyncErrorCloseEventReason.UNKNOWN_ERROR)
+				})
 			} else {
 				this.log?.error?.('Error assembling message', res.error)
 				// close the socket to reset the connection

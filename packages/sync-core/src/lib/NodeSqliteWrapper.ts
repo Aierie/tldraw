@@ -5,6 +5,7 @@ import {
 	type TLSyncSqliteWrapper,
 	type TLSyncSqliteWrapperConfig,
 } from './SQLiteSyncStorage'
+import { withSyncSpan } from './otel'
 
 /**
  * Minimal interface for a synchronous SQLite database.
@@ -74,7 +75,18 @@ export class NodeSqliteWrapper implements TLSyncSqliteWrapper {
 	) {}
 
 	exec(sql: string): void {
-		this.db.exec(sql)
+		withSyncSpan(
+			'tlsync.storage.sqlite.exec',
+			{
+				attributes: {
+					'db.system': 'sqlite',
+					'db.operation': 'exec',
+				},
+			},
+			() => {
+				this.db.exec(sql)
+			}
+		)
 	}
 
 	prepare<
@@ -85,15 +97,26 @@ export class NodeSqliteWrapper implements TLSyncSqliteWrapper {
 	}
 
 	transaction<T>(callback: () => T): T {
-		this.db.exec('BEGIN')
-		let result: T
-		try {
-			result = callback()
-		} catch (e) {
-			this.db.exec('ROLLBACK')
-			throw e
-		}
-		this.db.exec('COMMIT')
-		return result
+		return withSyncSpan(
+			'tlsync.storage.sqlite.transaction.wrapper',
+			{
+				attributes: {
+					'db.system': 'sqlite',
+					'db.operation': 'transaction',
+				},
+			},
+			() => {
+				this.db.exec('BEGIN')
+				let result: T
+				try {
+					result = callback()
+				} catch (e) {
+					this.db.exec('ROLLBACK')
+					throw e
+				}
+				this.db.exec('COMMIT')
+				return result
+			}
+		)
 	}
 }

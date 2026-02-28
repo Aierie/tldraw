@@ -34,6 +34,7 @@ import {
 	TLSocketServerSentDataEvent,
 	TLSocketServerSentEvent,
 } from './protocol'
+import { attachTraceCarrier, extractTraceContext, setSafeAttributes, withSyncSpan } from './otel'
 import { applyAndDiffRecord, diffAndValidateRecord, validateRecord } from './recordDiff'
 import {
 	RoomSession,
@@ -50,6 +51,10 @@ import {
 	TLSyncStorageTransaction,
 	toNetworkDiff,
 } from './TLSyncStorage'
+import {
+	summarizeNetworkDiff,
+	summarizeShapeHierarchyFromNetworkDiff,
+} from './shapeTelemetry'
 
 /**
  * WebSocket interface for server-side room connections. This defines the contract
@@ -305,25 +310,31 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 			return
 		}
 		if (session.socket.isOpen) {
-			if (message.type !== 'patch' && message.type !== 'push_result') {
+			const tracedMessage = message.trace ? message : attachTraceCarrier(message as any)
+			if (tracedMessage.type !== 'patch' && tracedMessage.type !== 'push_result') {
 				// this is not a data message
-				if (message.type !== 'pong') {
+				if (tracedMessage.type !== 'pong') {
 					// non-data messages like "connect" might still need to be ordered correctly with
 					// respect to data messages, so it's better to flush just in case
 					this._flushDataMessages(sessionId)
 				}
-				session.socket.sendMessage(message)
+				session.socket.sendMessage(tracedMessage as TLSocketServerSentEvent<R>)
 			} else {
+				const tracedDataMessage = tracedMessage as TLSocketServerSentDataEvent<R>
 				if (session.debounceTimer === null) {
 					// this is the first message since the last flush, don't delay it
-					session.socket.sendMessage({ type: 'data', data: [message] })
+					session.socket.sendMessage({
+						type: 'data',
+						data: [tracedDataMessage],
+						trace: tracedDataMessage.trace,
+					})
 
 					session.debounceTimer = setTimeout(
 						() => this._flushDataMessages(sessionId),
 						DATA_MESSAGE_DEBOUNCE_INTERVAL
 					)
 				} else {
-					session.outstandingDataMessages.push(message)
+					session.outstandingDataMessages.push(tracedDataMessage)
 				}
 			}
 		} else {
@@ -343,7 +354,11 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 		session.debounceTimer = null
 
 		if (session.outstandingDataMessages.length > 0) {
-			session.socket.sendMessage({ type: 'data', data: session.outstandingDataMessages })
+			session.socket.sendMessage({
+				type: 'data',
+				data: session.outstandingDataMessages,
+				trace: session.outstandingDataMessages[0]?.trace,
+			})
 			session.outstandingDataMessages.length = 0
 		}
 	}
@@ -433,29 +448,45 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 		const unmigrated = networkDiff ?? toNetworkDiff(diff)
 		if (!unmigrated) return this
 
-		this.sessions.forEach((session) => {
-			if (session.state !== RoomSessionState.Connected) return
-			if (sourceSessionId === session.sessionId) return
-			if (!session.socket.isOpen) {
-				this.cancelSession(session.sessionId)
-				return
+		return withSyncSpan(
+			'tlsync.room.broadcast_patch',
+			{
+				attributes: {
+					'tldraw.room.clock': this.lastDocumentClock,
+					'tldraw.room.sessions': this.sessions.size,
+					...summarizeNetworkDiff(unmigrated),
+					...summarizeShapeHierarchyFromNetworkDiff(unmigrated),
+				},
+			},
+			(span) => {
+				let fanout = 0
+				this.sessions.forEach((session) => {
+					if (session.state !== RoomSessionState.Connected) return
+					if (sourceSessionId === session.sessionId) return
+					if (!session.socket.isOpen) {
+						this.cancelSession(session.sessionId)
+						return
+					}
+
+					const diffResult = this.migrateDiffOrRejectSession(
+						session.sessionId,
+						session.serializedSchema,
+						session.requiresDownMigrations,
+						diff
+					)
+					if (!diffResult.ok) return
+
+					fanout++
+					this._unsafe_sendMessage(session.sessionId, {
+						type: 'patch',
+						diff: diffResult.value,
+						serverClock: this.lastDocumentClock,
+					})
+				})
+				setSafeAttributes(span, { 'tldraw.room.fanout': fanout })
+				return this
 			}
-
-			const diffResult = this.migrateDiffOrRejectSession(
-				session.sessionId,
-				session.serializedSchema,
-				session.requiresDownMigrations,
-				diff
-			)
-			if (!diffResult.ok) return
-
-			this._unsafe_sendMessage(session.sessionId, {
-				type: 'patch',
-				diff: diffResult.value,
-				serverClock: this.lastDocumentClock,
-			})
-		})
-		return this
+		)
 	}
 
 	/**
@@ -635,32 +666,46 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 			this.log?.warn?.('Received message from unknown session')
 			return
 		}
-		try {
-			switch (message.type) {
-				case 'connect': {
-					return this.handleConnectRequest(session, message)
-				}
-				case 'push': {
-					return this.handlePushRequest(session, message)
-				}
-				case 'ping': {
-					if (session.state === RoomSessionState.Connected) {
-						session.lastInteractionTime = Date.now()
+		const parentContext = extractTraceContext(message.trace)
+		return withSyncSpan(
+			'tlsync.room.handle_message',
+			{
+				attributes: {
+					'tldraw.msg.type': message.type,
+					'tldraw.room.session_id': sessionId,
+					'tldraw.room.readonly': session.isReadonly,
+				},
+			},
+			async () => {
+				try {
+					switch (message.type) {
+						case 'connect': {
+							return this.handleConnectRequest(session, message)
+						}
+						case 'push': {
+							return this.handlePushRequest(session, message)
+						}
+						case 'ping': {
+							if (session.state === RoomSessionState.Connected) {
+								session.lastInteractionTime = Date.now()
+							}
+							return this._unsafe_sendMessage(session.sessionId, { type: 'pong' })
+						}
+						default: {
+							exhaustiveSwitchError(message)
+						}
 					}
-					return this._unsafe_sendMessage(session.sessionId, { type: 'pong' })
+				} catch (e) {
+					if (e instanceof TLSyncError) {
+						this.rejectSession(session.sessionId, e.reason)
+					} else {
+						// log error and reboot the room?
+						throw e
+					}
 				}
-				default: {
-					exhaustiveSwitchError(message)
-				}
-			}
-		} catch (e) {
-			if (e instanceof TLSyncError) {
-				this.rejectSession(session.sessionId, e.reason)
-			} else {
-				// log error and reboot the room?
-				throw e
-			}
-		}
+			},
+			parentContext
+		)
 	}
 
 	/**
@@ -810,45 +855,62 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 			this._unsafe_sendMessage(session.sessionId, msg)
 		}
 
-		const { documentClock, result } = this.storage.transaction((txn) => {
-			this.broadcastChanges(txn)
-			const docChanges = txn.getChangesSince(message.lastServerClock)
-			const presenceDiff = this.migrateDiffOrRejectSession(
-				session.sessionId,
-				sessionSchema,
-				requiresDownMigrations,
-				{
-					puts: Object.fromEntries([...this.presenceStore.values()].map((p) => [p.id, p])),
-					deletes: [],
-				}
-			)
-			if (!presenceDiff.ok) return null
+		const { documentClock, result } = withSyncSpan(
+			'tlsync.room.connect',
+			{
+				attributes: {
+					'tldraw.msg.type': 'connect',
+					'tldraw.room.session_id': session.sessionId,
+					'tldraw.client.last_server_clock': message.lastServerClock,
+				},
+			},
+			(span) => {
+				const txResult = this.storage.transaction((txn) => {
+					this.broadcastChanges(txn)
+					const docChanges = txn.getChangesSince(message.lastServerClock)
+					const presenceDiff = this.migrateDiffOrRejectSession(
+						session.sessionId,
+						sessionSchema,
+						requiresDownMigrations,
+						{
+							puts: Object.fromEntries([...this.presenceStore.values()].map((p) => [p.id, p])),
+							deletes: [],
+						}
+					)
+					if (!presenceDiff.ok) return null
 
-			// Migrate the diff if needed, or use the pre-computed network diff
-			let docDiff: NetworkDiff<R> | null = null
-			if (docChanges && sessionSchema !== this.serializedSchema) {
-				const migrated = this.migrateDiffOrRejectSession(
-					session.sessionId,
-					sessionSchema,
-					requiresDownMigrations,
-					docChanges.diff
-				)
-				if (!migrated.ok) return null
-				docDiff = migrated.value
-			} else if (docChanges) {
-				docDiff = toNetworkDiff(docChanges.diff)
+					// Migrate the diff if needed, or use the pre-computed network diff
+					let docDiff: NetworkDiff<R> | null = null
+					if (docChanges && sessionSchema !== this.serializedSchema) {
+						const migrated = this.migrateDiffOrRejectSession(
+							session.sessionId,
+							sessionSchema,
+							requiresDownMigrations,
+							docChanges.diff
+						)
+						if (!migrated.ok) return null
+						docDiff = migrated.value
+					} else if (docChanges) {
+						docDiff = toNetworkDiff(docChanges.diff)
+					}
+					if (docDiff) {
+						setSafeAttributes(span, summarizeNetworkDiff(docDiff))
+					}
+					return attachTraceCarrier({
+						type: 'connect',
+						connectRequestId: message.connectRequestId,
+						hydrationType: docChanges?.wipeAll ? 'wipe_all' : 'wipe_presence',
+						protocolVersion: getTlsyncProtocolVersion(),
+						schema: this.schema.serialize(),
+						serverClock: txn.getClock(),
+						diff: { ...presenceDiff.value, ...docDiff },
+						isReadonly: session.isReadonly,
+					}) satisfies Extract<TLSocketServerSentEvent<R>, { type: 'connect' }>
+				}) // no id needed because this only reads, no writes.
+				setSafeAttributes(span, { 'tldraw.room.clock': txResult.documentClock })
+				return txResult
 			}
-			return {
-				type: 'connect',
-				connectRequestId: message.connectRequestId,
-				hydrationType: docChanges?.wipeAll ? 'wipe_all' : 'wipe_presence',
-				protocolVersion: getTlsyncProtocolVersion(),
-				schema: this.schema.serialize(),
-				serverClock: txn.getClock(),
-				diff: { ...presenceDiff.value, ...docDiff },
-				isReadonly: session.isReadonly,
-			} satisfies Extract<TLSocketServerSentEvent<R>, { type: 'connect' }>
-		}) // no id needed because this only reads, no writes.
+		)
 
 		this.lastDocumentClock = documentClock
 
@@ -870,6 +932,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 			session.lastInteractionTime = Date.now()
 		}
 
+		const parentContext = extractTraceContext(message.trace)
 		const legacyAppendMode = !this.getCanEmitStringAppend()
 
 		interface ActualChanges {
@@ -992,83 +1055,107 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 			}
 		}
 
-		const { result, documentClock, changes } = this.storage.transaction(
-			(txn) => {
-				this.broadcastChanges(txn)
-				// collect actual ops that resulted from the push
-				// these will be broadcast to other users
-
-				const docChanges: ActualChanges = { diffs: null }
-				const presenceChanges: ActualChanges = { diffs: null }
-
-				if (this.presenceType && session?.presenceId && 'presence' in message && message.presence) {
-					if (!session) throw new Error('session is required for presence pushes')
-					// The push request was for the presence scope.
-					const id = session.presenceId
-					const [type, val] = message.presence
-					const { typeName } = this.presenceType
-					switch (type) {
-						case RecordOpType.Put: {
-							// Try to put the document. If it fails, stop here.
-							addDocument(this.presenceStore, presenceChanges, id, {
-								...val,
-								id,
-								typeName,
-							})
-							break
-						}
-						case RecordOpType.Patch: {
-							// Try to patch the document. If it fails, stop here.
-							patchDocument(this.presenceStore, presenceChanges, id, {
-								...val,
-								id: [ValueOpType.Put, id],
-								typeName: [ValueOpType.Put, typeName],
-							})
-							break
-						}
-					}
-				}
-				if (message.diff && !session?.isReadonly) {
-					// The push request was for the document scope.
-					for (const [id, op] of objectMapEntriesIterable(message.diff!)) {
-						switch (op[0]) {
-							case RecordOpType.Put: {
-								// Try to add the document.
-								// If we're putting a record with a type that we don't recognize, fail
-								if (!this.documentTypes.has(op[1].typeName)) {
-									throw new TLSyncError(
-										'invalid record',
-										TLSyncErrorCloseEventReason.INVALID_RECORD
-									)
-								}
-								addDocument(txn, docChanges, id, op[1])
-								break
-							}
-							case RecordOpType.Patch: {
-								// Try to patch the document. If it fails, stop here.
-								patchDocument(txn, docChanges, id, op[1])
-								break
-							}
-							case RecordOpType.Remove: {
-								const doc = txn.get(id)
-								if (!doc) {
-									// If the doc was already deleted, don't do anything, no need to propagate a delete op
-									continue
-								}
-
-								// Delete the document and propagate the delete op
-								// delete automatically creates tombstones
-								txn.delete(id)
-								propagateOp(docChanges, id, op, doc, undefined)
-								break
-							}
-						}
-					}
-				}
-
-				return { docChanges, presenceChanges }
+		const { result, documentClock, changes } = withSyncSpan(
+			'tlsync.room.push',
+			{
+				attributes: {
+					'tldraw.msg.type': 'push',
+					'tldraw.room.session_id': session?.sessionId,
+					'tldraw.room.readonly': !!session?.isReadonly,
+					'tldraw.client.clock': message.clientClock,
+					...summarizeNetworkDiff(message.diff),
+					...summarizeShapeHierarchyFromNetworkDiff(message.diff),
+				},
 			},
-			{ id: this.internalTxnId, emitChanges: 'when-different' }
+			(span) => {
+				const txResult = this.storage.transaction(
+					(txn) => {
+						this.broadcastChanges(txn)
+						// collect actual ops that resulted from the push
+						// these will be broadcast to other users
+
+						const docChanges: ActualChanges = { diffs: null }
+						const presenceChanges: ActualChanges = { diffs: null }
+
+						if (this.presenceType && session?.presenceId && 'presence' in message && message.presence) {
+							if (!session) throw new Error('session is required for presence pushes')
+							// The push request was for the presence scope.
+							const id = session.presenceId
+							const [type, val] = message.presence
+							const { typeName } = this.presenceType
+							switch (type) {
+								case RecordOpType.Put: {
+									// Try to put the document. If it fails, stop here.
+									addDocument(this.presenceStore, presenceChanges, id, {
+										...val,
+										id,
+										typeName,
+									})
+									break
+								}
+								case RecordOpType.Patch: {
+									// Try to patch the document. If it fails, stop here.
+									patchDocument(this.presenceStore, presenceChanges, id, {
+										...val,
+										id: [ValueOpType.Put, id],
+										typeName: [ValueOpType.Put, typeName],
+									})
+									break
+								}
+							}
+						}
+						if (message.diff && !session?.isReadonly) {
+							// The push request was for the document scope.
+							for (const [id, op] of objectMapEntriesIterable(message.diff!)) {
+								switch (op[0]) {
+									case RecordOpType.Put: {
+										// Try to add the document.
+										// If we're putting a record with a type that we don't recognize, fail
+										if (!this.documentTypes.has(op[1].typeName)) {
+											throw new TLSyncError(
+												'invalid record',
+												TLSyncErrorCloseEventReason.INVALID_RECORD
+											)
+										}
+										addDocument(txn, docChanges, id, op[1])
+										break
+									}
+									case RecordOpType.Patch: {
+										// Try to patch the document. If it fails, stop here.
+										patchDocument(txn, docChanges, id, op[1])
+										break
+									}
+									case RecordOpType.Remove: {
+										const doc = txn.get(id)
+										if (!doc) {
+											// If the doc was already deleted, don't do anything, no need to propagate a delete op
+											continue
+										}
+
+										// Delete the document and propagate the delete op
+										// delete automatically creates tombstones
+										txn.delete(id)
+										propagateOp(docChanges, id, op, doc, undefined)
+										break
+									}
+								}
+							}
+						}
+
+						return { docChanges, presenceChanges }
+					},
+					{ id: this.internalTxnId, emitChanges: 'when-different' }
+				)
+				setSafeAttributes(span, {
+					'tldraw.room.clock': txResult.documentClock,
+					'tldraw.room.did_change': txResult.didChange,
+				})
+				if (txResult.changes) {
+					setSafeAttributes(span, summarizeShapeHierarchyFromNetworkDiff(toNetworkDiff(txResult.changes)))
+				}
+				return txResult
+			},
+			parentContext
 		)
 
 		this.lastDocumentClock = documentClock
@@ -1115,7 +1202,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 		}
 
 		if (session && pushResult) {
-			this._unsafe_sendMessage(session.sessionId, pushResult)
+			this._unsafe_sendMessage(session.sessionId, attachTraceCarrier(pushResult))
 		}
 		if (result.docChanges.diffs || result.presenceChanges.diffs) {
 			this.broadcastPatch(

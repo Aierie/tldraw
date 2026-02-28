@@ -25,10 +25,20 @@ export {
 	type TLConnectRequest,
 	type TLPingRequest,
 	type TLPushRequest,
+	type TLTraceCarrier,
 	type TLSocketClientSentEvent,
 	type TLSocketServerSentDataEvent,
 	type TLSocketServerSentEvent,
 } from './lib/protocol'
+export {
+	attachTraceCarrier,
+	extractTraceContext,
+	getActiveTraceCarrier,
+	getSyncTracer,
+	recordSpanError,
+	setSafeAttributes,
+	withSyncSpan,
+} from './lib/otel'
 export { RoomSessionState, type RoomSession, type RoomSessionBase } from './lib/RoomSession'
 export type { PersistedRoomSnapshotForSupabase } from './lib/server-types'
 export type { WebSocketMinimal } from './lib/ServerSocketAdapter'
@@ -41,6 +51,11 @@ export {
 	type TLSyncSqliteWrapper,
 	type TLSyncSqliteWrapperConfig,
 } from './lib/SQLiteSyncStorage'
+export {
+	summarizeForwardDiff,
+	summarizeNetworkDiff,
+	summarizeShapeHierarchyFromNetworkDiff,
+} from './lib/shapeTelemetry'
 export { TLRemoteSyncError } from './lib/TLRemoteSyncError'
 export {
 	TLSocketRoom,

@@ -27,6 +27,7 @@ import { IRequest, cors, json } from 'itty-router'
 import { adminRoutes } from './adminRoutes'
 import { POSTHOG_URL } from './config'
 import { healthCheckRoutes } from './healthCheckRoutes'
+import { flushOtel, initOtel } from './otel'
 import { createPostgresConnectionPool } from './postgres'
 import { createRoomSnapshot } from './routes/createRoomSnapshot'
 import { extractBookmarkMetadata } from './routes/extractBookmarkMetadata'
@@ -208,6 +209,7 @@ const router = createRouter<Environment>()
 
 export default class Worker extends WorkerEntrypoint<Environment> {
 	override async fetch(request: Request): Promise<Response> {
+		initOtel(this.env)
 		// if we get a request that starts with /api/, strip it before handling.
 		const url = new URL(request.url)
 		const pathname = url.pathname.replace(/^\/api\//, '/')
@@ -216,43 +218,47 @@ export default class Worker extends WorkerEntrypoint<Environment> {
 			request = new Request(url.toString(), request)
 		}
 
-		return await handleApiRequest({
-			router,
-			request,
-			env: this.env,
-			ctx: this.ctx,
-			after: (response, request) => {
-				// getAll is a Cloudflare-specific method
-				const setCookies = (
-					response.headers as unknown as import('@cloudflare/workers-types').Headers
-				).getAll('set-cookie')
-				// Create a new Response with mutable headers before passing to corsify
-				// to avoid "Can't modify immutable headers" error
-				const mutableResponse = new Response(response.body, response)
-				// unfortunately corsify mishandles the set-cookie header, so
-				// we need to manually add it back in
-				const result = corsify(mutableResponse, request)
-				if ([...setCookies].length === 0) {
-					return result
+		try {
+			return await handleApiRequest({
+				router,
+				request,
+				env: this.env,
+				ctx: this.ctx,
+				after: (response, request) => {
+					// getAll is a Cloudflare-specific method
+					const setCookies = (
+						response.headers as unknown as import('@cloudflare/workers-types').Headers
+					).getAll('set-cookie')
+					// Create a new Response with mutable headers before passing to corsify
+					// to avoid "Can't modify immutable headers" error
+					const mutableResponse = new Response(response.body, response)
+					// unfortunately corsify mishandles the set-cookie header, so
+					// we need to manually add it back in
+					const result = corsify(mutableResponse, request)
+					if ([...setCookies].length === 0) {
+						return result
+					}
+					const newResponse = new Response(result.body, result)
+					newResponse.headers.delete('set-cookie')
+					// add cookies from original response
+					for (const cookie of setCookies) {
+						newResponse.headers.append('set-cookie', cookie)
+					}
+					return newResponse
+				},
+			}).catch((err) => {
+				const sentry = createSentry(this.ctx, this.env, request)
+				if (sentry) {
+					// eslint-disable-next-line @typescript-eslint/no-deprecated
+					sentry.captureException(err)
+				} else {
+					console.error(err)
 				}
-				const newResponse = new Response(result.body, result)
-				newResponse.headers.delete('set-cookie')
-				// add cookies from original response
-				for (const cookie of setCookies) {
-					newResponse.headers.append('set-cookie', cookie)
-				}
-				return newResponse
-			},
-		}).catch((err) => {
-			const sentry = createSentry(this.ctx, this.env, request)
-			if (sentry) {
-				// eslint-disable-next-line @typescript-eslint/no-deprecated
-				sentry.captureException(err)
-			} else {
-				console.error(err)
-			}
-			throw err
-		})
+				throw err
+			})
+		} finally {
+			this.ctx.waitUntil(flushOtel())
+		}
 	}
 
 	// RPC methods — only callable by workers with a service binding, not from the public internet.

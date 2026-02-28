@@ -307,6 +307,11 @@ export function useSync(opts: UseSyncOptions & TLStoreSchemaOptions): RemoteTLSt
 		const client = new TLSyncClient<TLRecord, TLStore>({
 			store,
 			socket,
+			telemetryContext: {
+				'tldraw.room_id': roomId,
+				'tldraw.store_id': storeId,
+				'tldraw.session_id': TAB_ID,
+			},
 			didCancel: () => didCancel,
 			onLoad(client) {
 				track?.(MULTIPLAYER_EVENT_NAME, { name: 'load', roomId })

@@ -64,6 +64,12 @@ export interface Environment {
 	USER_CONTENT_URL: string | undefined
 	MULTIPLAYER_SERVER: string | undefined
 
+	OTEL_ENABLED: string | undefined
+	OTEL_SERVICE_NAME: string | undefined
+	OTEL_EXPORTER_OTLP_ENDPOINT: string | undefined
+	OTEL_SAMPLE_RATIO: string | undefined
+	OTEL_EXPORTER_OTLP_HEADERS: string | undefined
+
 	HEALTH_CHECK_BEARER_TOKEN: string | undefined
 
 	ANALYTICS_API_URL: string | undefined

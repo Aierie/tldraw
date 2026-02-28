@@ -1,0 +1,36 @@
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+        cors:
+          allowed_origins:
+            - "http://localhost:*"
+            - "http://127.0.0.1:*"
+            - "https://localhost:*"
+            - "https://127.0.0.1:*"
+
+processors:
+  batch:
+    timeout: 500ms
+
+exporters:
+  debug:
+    verbosity: basic
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+  file:
+    path: /var/lib/otel/traces.jsonl
+    rotation:
+      max_megabytes: 20
+      max_days: 1
+      max_backups: 5
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug, otlp/jaeger, file]

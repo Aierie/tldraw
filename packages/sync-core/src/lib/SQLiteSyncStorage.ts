@@ -7,6 +7,8 @@ import {
 	MAX_TOMBSTONES,
 } from './InMemorySyncStorage'
 import { MicrotaskNotifier } from './MicrotaskNotifier'
+import { setSafeAttributes, withSyncSpan } from './otel'
+import { summarizeForwardDiff, summarizeShapeHierarchyFromNetworkDiff } from './shapeTelemetry'
 import { RoomSnapshot } from './TLSyncRoom'
 import {
 	convertStoreSnapshotToRoomSnapshot,
@@ -18,6 +20,7 @@ import {
 	TLSyncStorageTransactionCallback,
 	TLSyncStorageTransactionOptions,
 	TLSyncStorageTransactionResult,
+	toNetworkDiff,
 } from './TLSyncStorage'
 
 /**
@@ -392,36 +395,61 @@ export class SQLiteSyncStorage<R extends UnknownRecord> implements TLSyncStorage
 	): TLSyncStorageTransactionResult<T, R> {
 		const clockBefore = this.getClock()
 		const trackChanges = opts?.emitChanges === 'always'
-		return this.sql.transaction(() => {
-			const txn = new SQLiteSyncStorageTransaction<R>(this, this.stmts)
-			let result: T
-			let changes: TLSyncForwardDiff<R> | undefined
-			try {
-				result = transaction(() => {
-					return callback(txn)
-				}) as T
-				if (trackChanges) {
-					changes = txn.getChangesSince(clockBefore)?.diff
-				}
-			} finally {
-				txn.close()
-			}
-			if (
-				typeof result === 'object' &&
-				result &&
-				'then' in result &&
-				typeof result.then === 'function'
-			) {
-				throw new Error('Transaction must return a value, not a promise')
-			}
+		return withSyncSpan(
+			'tlsync.storage.sqlite.transaction',
+			{
+				attributes: {
+					'db.system': 'sqlite',
+					'tldraw.storage.txn.id': opts?.id,
+					'tldraw.storage.txn.emit_changes': opts?.emitChanges,
+					'tldraw.storage.clock_before': clockBefore,
+				},
+			},
+			(span) => {
+				const txResult = this.sql.transaction(() => {
+					const txn = new SQLiteSyncStorageTransaction<R>(this, this.stmts)
+					let result: T
+					let changes: TLSyncForwardDiff<R> | undefined
+					try {
+						result = transaction(() => {
+							return callback(txn)
+						}) as T
+						if (trackChanges) {
+							changes = txn.getChangesSince(clockBefore)?.diff
+						}
+					} finally {
+						txn.close()
+					}
+					if (
+						typeof result === 'object' &&
+						result &&
+						'then' in result &&
+						typeof result.then === 'function'
+					) {
+						throw new Error('Transaction must return a value, not a promise')
+					}
 
-			const clockAfter = this.getClock()
-			const didChange = clockAfter > clockBefore
-			if (didChange) {
-				this.notifier.notify({ id: opts?.id, documentClock: clockAfter })
+					const clockAfter = this.getClock()
+					const didChange = clockAfter > clockBefore
+					if (didChange) {
+						this.notifier.notify({ id: opts?.id, documentClock: clockAfter })
+					}
+					return { documentClock: clockAfter, didChange: clockAfter > clockBefore, result, changes }
+				})
+				setSafeAttributes(span, {
+					'tldraw.storage.clock_after': txResult.documentClock,
+					'tldraw.storage.did_change': txResult.didChange,
+				})
+				if (txResult.changes) {
+					setSafeAttributes(span, summarizeForwardDiff(txResult.changes as TLSyncForwardDiff<UnknownRecord>))
+					setSafeAttributes(
+						span,
+						summarizeShapeHierarchyFromNetworkDiff(toNetworkDiff(txResult.changes))
+					)
+				}
+				return txResult
 			}
-			return { documentClock: clockAfter, didChange: clockAfter > clockBefore, result, changes }
-		})
+		)
 	}
 
 	getClock(): number {

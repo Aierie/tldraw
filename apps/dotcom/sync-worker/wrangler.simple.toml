@@ -1,0 +1,27 @@
+name = "sync-core-otel-example"
+main = "src/simple/worker.ts"
+compatibility_date = "2025-05-08"
+compatibility_flags = ["nodejs_compat"]
+upload_source_maps = true
+
+[dev]
+port = 8790
+ip = "127.0.0.1"
+
+[observability]
+enabled = true
+
+[vars]
+OTEL_ENABLED = "false"
+OTEL_SAMPLE_RATIO = "1"
+OTEL_SERVICE_NAME = "tldraw-sync-core-simple-worker"
+WORKER_ENV = "development"
+
+[durable_objects]
+bindings = [
+	{ name = "SIMPLE_TLDRAW_DURABLE_OBJECT", class_name = "SimpleTldrawDurableObject" },
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SimpleTldrawDurableObject"]

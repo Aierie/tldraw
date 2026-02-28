@@ -60,6 +60,10 @@ BOTCOM_POSTGRES_CONNECTION_STRING = "postgresql://user:password@127.0.0.1:6543/p
 BOTCOM_POSTGRES_POOLED_CONNECTION_STRING = "postgresql://user:password@127.0.0.1:6432/postgres"
 TLDRAW_ENV = "development"
 MULTIPLAYER_SERVER = "http://localhost:3000"
+OTEL_ENABLED = "true"
+OTEL_SERVICE_NAME = "tldraw-sync-worker"
+OTEL_EXPORTER_OTLP_ENDPOINT = "http://127.0.0.1:4318/v1/traces"
+OTEL_SAMPLE_RATIO = "1"
 
 # we don't have a hard-coded name for preview. we instead have to generate it at build time and append it to this file.
 

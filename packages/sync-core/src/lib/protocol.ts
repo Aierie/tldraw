@@ -73,6 +73,16 @@ export type TLIncompatibilityReason =
 	(typeof TLIncompatibilityReason)[keyof typeof TLIncompatibilityReason]
 
 /**
+ * W3C Trace Context carrier used to propagate distributed tracing context over sync protocol messages.
+ *
+ * @public
+ */
+export interface TLTraceCarrier {
+	traceparent?: string
+	tracestate?: string
+}
+
+/**
  * Union type representing all possible message types that can be sent from server to client.
  *
  * This encompasses the complete set of server-originated WebSocket messages in the tldraw
@@ -106,17 +116,20 @@ export type TLSocketServerSentEvent<R extends UnknownRecord> =
 			diff: NetworkDiff<R>
 			serverClock: number
 			isReadonly: boolean
+			trace?: TLTraceCarrier
 	  }
 	| {
 			type: 'incompatibility_error'
 			// eslint-disable-next-line @typescript-eslint/no-deprecated
 			reason: TLIncompatibilityReason
+			trace?: TLTraceCarrier
 	  }
 	| {
 			type: 'pong'
+			trace?: TLTraceCarrier
 	  }
-	| { type: 'data'; data: TLSocketServerSentDataEvent<R>[] }
-	| { type: 'custom'; data: any }
+	| { type: 'data'; data: TLSocketServerSentDataEvent<R>[]; trace?: TLTraceCarrier }
+	| { type: 'custom'; data: any; trace?: TLTraceCarrier }
 	| TLSocketServerSentDataEvent<R>
 
 /**
@@ -149,12 +162,14 @@ export type TLSocketServerSentDataEvent<R extends UnknownRecord> =
 			type: 'patch'
 			diff: NetworkDiff<R>
 			serverClock: number
+			trace?: TLTraceCarrier
 	  }
 	| {
 			type: 'push_result'
 			clientClock: number
 			serverClock: number
 			action: 'discard' | 'commit' | { rebaseWithDiff: NetworkDiff<R> }
+			trace?: TLTraceCarrier
 	  }
 
 /**
@@ -186,6 +201,7 @@ export interface TLPushRequest<R extends UnknownRecord> {
 	clientClock: number
 	diff?: NetworkDiff<R>
 	presence?: [typeof RecordOpType.Patch, ObjectDiff] | [typeof RecordOpType.Put, R]
+	trace?: TLTraceCarrier
 }
 
 /**
@@ -215,6 +231,7 @@ export interface TLConnectRequest {
 	lastServerClock: number
 	protocolVersion: number
 	schema: SerializedSchema
+	trace?: TLTraceCarrier
 }
 
 /**
@@ -235,6 +252,7 @@ export interface TLConnectRequest {
  */
 export interface TLPingRequest {
 	type: 'ping'
+	trace?: TLTraceCarrier
 }
 
 /**

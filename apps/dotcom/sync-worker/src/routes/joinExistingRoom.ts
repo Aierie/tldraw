@@ -1,4 +1,5 @@
 import { ROOM_PREFIX, RoomOpenMode } from '@tldraw/dotcom-shared'
+import { withSyncSpan } from '@tldraw/sync-core'
 import { notFound } from '@tldraw/worker-shared'
 import { IRequest } from 'itty-router'
 import { Environment } from '../types'
@@ -10,16 +11,28 @@ export async function joinExistingRoom(
 	env: Environment,
 	roomOpenMode: RoomOpenMode
 ): Promise<Response> {
-	const roomId = await getSlug(env, request.params.roomId, roomOpenMode)
-	if (!roomId) return notFound()
-	if (isRoomIdTooLong(roomId)) return roomIdIsTooLong()
+	return withSyncSpan(
+		'tlsync.worker.join_existing_room',
+		{
+			attributes: {
+				'tldraw.msg.type': 'join',
+				'tldraw.route.room_open_mode': roomOpenMode,
+			},
+		},
+		async (span) => {
+			const roomId = await getSlug(env, request.params.roomId, roomOpenMode)
+			span.setAttribute('tldraw.room_id', roomId ?? 'missing')
+			if (!roomId) return notFound()
+			if (isRoomIdTooLong(roomId)) return roomIdIsTooLong()
 
-	// This needs to be a websocket request!
-	if (request.headers.get('upgrade')?.toLowerCase() === 'websocket') {
-		// Set up the durable object for this room
-		const id = env.TLDR_DOC.idFromName(`/${ROOM_PREFIX}/${roomId}`)
-		return env.TLDR_DOC.get(id).fetch(request)
-	}
+			// This needs to be a websocket request!
+			if (request.headers.get('upgrade')?.toLowerCase() === 'websocket') {
+				// Set up the durable object for this room
+				const id = env.TLDR_DOC.idFromName(`/${ROOM_PREFIX}/${roomId}`)
+				return env.TLDR_DOC.get(id).fetch(request)
+			}
 
-	return notFound()
+			return notFound()
+		}
+	)
 }

@@ -28,6 +28,7 @@ import {
 	TLSyncErrorCloseEventReason,
 	TLSyncStorage,
 	loadSnapshotIntoStorage,
+	withSyncSpan,
 	type PersistedRoomSnapshotForSupabase,
 } from '@tldraw/sync-core'
 import { TLAsset, TLDOCUMENT_ID, TLDocument, TLRecord, createTLSchema } from '@tldraw/tlschema'
@@ -44,6 +45,7 @@ import { DurableObject } from 'cloudflare:workers'
 import { IRequest, Router } from 'itty-router'
 import { Kysely } from 'kysely'
 import { PERSIST_INTERVAL_MS } from './config'
+import { flushOtel, initOtel } from './otel'
 import { createPostgresConnectionPool } from './postgres'
 import { getR2KeyForRoom } from './r2'
 import { getPublishedRoomSnapshot } from './routes/tla/getPublishedFile'
@@ -247,6 +249,7 @@ export class TLFileDurableObject extends DurableObject {
 		super(state, env)
 		this.id = state.id
 		this.storage = state.storage
+		initOtel(env)
 		this.sentryDSN = env.SENTRY_DSN
 		this.measure = env.MEASURE
 		this.sentry = createSentry(this.state, this.env)
@@ -348,6 +351,8 @@ export class TLFileDurableObject extends DurableObject {
 				status: 500,
 				statusText: 'Internal Server Error',
 			})
+		} finally {
+			this.state.waitUntil(flushOtel())
 		}
 	}
 
@@ -946,8 +951,16 @@ export class TLFileDurableObject extends DurableObject {
 
 	// Save the room to r2
 	async persistToDatabase() {
-		await this.executionQueue
-			.push(async () => {
+		return withSyncSpan(
+			'tlsync.worker.persist_to_database',
+			{
+				attributes: {
+					'tldraw.room_id': this._documentInfo?.slug ?? 'unknown',
+				},
+			},
+			async () => {
+				await this.executionQueue
+					.push(async () => {
 				await retry(
 					async ({ attempt }) => {
 						if (attempt === PERSIST_RETRIES_NOTIFY_THRESHOLD && !this.persistenceBad) {
@@ -1002,10 +1015,12 @@ export class TLFileDurableObject extends DurableObject {
 					{ attempts: PERSIST_RETRIES_MAX, waitDuration: 2000 }
 				)
 			})
-			.catch((e) => {
-				this.logEvent({ type: 'room', roomId: this.documentInfo.slug, name: 'fail_persist' })
-				this.reportError(e)
-			})
+					.catch((e) => {
+						this.logEvent({ type: 'room', roomId: this.documentInfo.slug, name: 'fail_persist' })
+						this.reportError(e)
+					})
+			}
+		)
 	}
 
 	private async _uploadSnapshotToR2(snapshot: RoomSnapshot, key: string) {
