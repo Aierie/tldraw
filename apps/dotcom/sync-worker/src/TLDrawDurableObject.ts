@@ -45,7 +45,7 @@ import { DurableObject } from 'cloudflare:workers'
 import { IRequest, Router } from 'itty-router'
 import { Kysely } from 'kysely'
 import { PERSIST_INTERVAL_MS } from './config'
-import { flushOtel, initOtel } from './otel'
+import { extractRequestContext, flushOtel, initOtel } from './otel'
 import { createPostgresConnectionPool } from './postgres'
 import { getR2KeyForRoom } from './r2'
 import { getPublishedRoomSnapshot } from './routes/tla/getPublishedFile'
@@ -340,20 +340,33 @@ export class TLFileDurableObject extends DurableObject {
 	// Handle a request to the Durable Object.
 	override async fetch(req: IRequest) {
 		const sentry = createSentry(this.state, this.env, req)
+		const traceContext = extractRequestContext(req.headers)
 
-		try {
-			return await this.router.fetch(req)
-		} catch (err) {
-			console.error(err)
-			// eslint-disable-next-line @typescript-eslint/no-deprecated
-			sentry?.captureException(err)
-			return new Response('Something went wrong', {
-				status: 500,
-				statusText: 'Internal Server Error',
-			})
-		} finally {
-			this.state.waitUntil(flushOtel())
-		}
+		return withSyncSpan(
+			'tlsync.worker.do.fetch',
+			{
+				attributes: {
+					'http.method': req.method,
+					'http.path': new URL(req.url).pathname,
+				},
+			},
+			async () => {
+				try {
+					return await this.router.fetch(req)
+				} catch (err) {
+					console.error(err)
+					// eslint-disable-next-line @typescript-eslint/no-deprecated
+					sentry?.captureException(err)
+					return new Response('Something went wrong', {
+						status: 500,
+						statusText: 'Internal Server Error',
+					})
+				} finally {
+					this.state.waitUntil(flushOtel())
+				}
+			},
+			traceContext
+		)
 	}
 
 	_isRestoring = false
@@ -961,60 +974,60 @@ export class TLFileDurableObject extends DurableObject {
 			async () => {
 				await this.executionQueue
 					.push(async () => {
-				await retry(
-					async ({ attempt }) => {
-						if (attempt === PERSIST_RETRIES_NOTIFY_THRESHOLD && !this.persistenceBad) {
-							this.broadcastPersistenceEvent({ type: 'persistence_bad' })
-							this.persistenceBad = true
-						}
-						// check whether the worker was woken up to persist after having gone to sleep
-						if (!this._room) return
-						const slug = this.documentInfo.slug
-						const storage = await this.getStorage()
-						assert(storage instanceof SQLiteSyncStorage, 'storage must be a SQLiteSyncStorage')
-						if (this._lastPersistedClock === storage.getClock()) return
-						if (this._isRestoring) return
+						await retry(
+							async ({ attempt }) => {
+								if (attempt === PERSIST_RETRIES_NOTIFY_THRESHOLD && !this.persistenceBad) {
+									this.broadcastPersistenceEvent({ type: 'persistence_bad' })
+									this.persistenceBad = true
+								}
+								// check whether the worker was woken up to persist after having gone to sleep
+								if (!this._room) return
+								const slug = this.documentInfo.slug
+								const storage = await this.getStorage()
+								assert(storage instanceof SQLiteSyncStorage, 'storage must be a SQLiteSyncStorage')
+								if (this._lastPersistedClock === storage.getClock()) return
+								if (this._isRestoring) return
 
-						const snapshot = storage.getSnapshot()
-						assert(snapshot.documentClock !== undefined, 'documentClock must be present')
-						this.maybeAssociateFileAssets()
+								const snapshot = storage.getSnapshot()
+								assert(snapshot.documentClock !== undefined, 'documentClock must be present')
+								this.maybeAssociateFileAssets()
 
-						const key = getR2KeyForRoom({ slug: slug, isApp: this.documentInfo.isApp })
-						await this._uploadSnapshotToR2(snapshot, key)
-						await this.persistToPierre(storage, snapshot)
+								const key = getR2KeyForRoom({ slug: slug, isApp: this.documentInfo.isApp })
+								await this._uploadSnapshotToR2(snapshot, key)
+								await this.persistToPierre(storage, snapshot)
 
-						this.logEvent({ type: 'persist_success', attempts: attempt })
-						this._lastPersistedClock = snapshot.documentClock
-						// Store the clock in DO storage so we can compare against SQLite on next load.
-						if (this.persistenceBad) {
-							this.broadcastPersistenceEvent({ type: 'persistence_good' })
-							this.persistenceBad = false
-						}
+								this.logEvent({ type: 'persist_success', attempts: attempt })
+								this._lastPersistedClock = snapshot.documentClock
+								// Store the clock in DO storage so we can compare against SQLite on next load.
+								if (this.persistenceBad) {
+									this.broadcastPersistenceEvent({ type: 'persistence_good' })
+									this.persistenceBad = false
+								}
 
-						// Update the updatedAt timestamp in the database
-						if (this.documentInfo.isApp) {
-							// don't await on this because otherwise
-							// if this logic is invoked during another db transaction
-							// (e.g. when publishing a file)
-							// that transaction will deadlock
-							this.db
-								.updateTable('file')
-								.set({ updatedAt: new Date().getTime() })
-								.where('id', '=', this.documentInfo.slug)
-								.execute()
-								.catch((e) => {
-									this.logEvent({
-										type: 'room',
-										roomId: this.documentInfo.slug,
-										name: 'failed_persist_to_db',
-									})
-									this.reportError(e)
-								})
-						}
-					},
-					{ attempts: PERSIST_RETRIES_MAX, waitDuration: 2000 }
-				)
-			})
+								// Update the updatedAt timestamp in the database
+								if (this.documentInfo.isApp) {
+									// don't await on this because otherwise
+									// if this logic is invoked during another db transaction
+									// (e.g. when publishing a file)
+									// that transaction will deadlock
+									this.db
+										.updateTable('file')
+										.set({ updatedAt: new Date().getTime() })
+										.where('id', '=', this.documentInfo.slug)
+										.execute()
+										.catch((e) => {
+											this.logEvent({
+												type: 'room',
+												roomId: this.documentInfo.slug,
+												name: 'failed_persist_to_db',
+											})
+											this.reportError(e)
+										})
+								}
+							},
+							{ attempts: PERSIST_RETRIES_MAX, waitDuration: 2000 }
+						)
+					})
 					.catch((e) => {
 						this.logEvent({ type: 'room', roomId: this.documentInfo.slug, name: 'fail_persist' })
 						this.reportError(e)

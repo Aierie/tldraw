@@ -7,7 +7,9 @@ import {
 	trace,
 	type Context,
 	type TextMapGetter,
+	type TextMapSetter,
 } from '@opentelemetry/api'
+import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks'
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http'
 import { resourceFromAttributes } from '@opentelemetry/resources'
 import {
@@ -28,6 +30,7 @@ export interface SimpleOtelEnvironment {
 
 let didInitialize = false
 let provider: BasicTracerProvider | null = null
+let didSetContextManager = false
 
 function isEnabled(env: SimpleOtelEnvironment) {
 	return env.OTEL_ENABLED === 'true' && !!env.OTEL_EXPORTER_OTLP_ENDPOINT
@@ -64,6 +67,11 @@ export function initSimpleOtel(env: SimpleOtelEnvironment) {
 
 	if (env.WORKER_ENV === 'development') {
 		diag.setLogger(new DiagConsoleLogger(), DiagLogLevel.ERROR)
+	}
+
+	if (!didSetContextManager) {
+		context.setGlobalContextManager(new AsyncLocalStorageContextManager())
+		didSetContextManager = true
 	}
 
 	const exporter = new OTLPTraceExporter({
@@ -112,4 +120,19 @@ const headersGetter: TextMapGetter<Headers> = {
 
 export function extractRequestContext(headers: Headers): Context {
 	return propagation.extract(context.active(), headers, headersGetter)
+}
+
+const headersSetter: TextMapSetter<Headers> = {
+	set(carrier, key, value) {
+		carrier.set(key, value)
+	},
+}
+
+export function injectTraceHeaders(
+	headers?: HeadersInit,
+	ctx: Context = context.active()
+): Headers {
+	const nextHeaders = new Headers(headers)
+	propagation.inject(ctx, nextHeaders, headersSetter)
+	return nextHeaders
 }

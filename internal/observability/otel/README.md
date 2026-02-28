@@ -74,6 +74,25 @@ Use this OTLP HTTP endpoint in whichever runtime initializes an OTel SDK/exporte
 
 - `http://localhost:4318/v1/traces`
 
+## Interpreting `traces.jsonl`
+
+- `internal/observability/otel/data/traces.jsonl` is newline-delimited **OTLP export payloads**.
+- Each line is one exporter batch flush, and can contain many spans.
+- So a small file with only a few lines can still represent dozens of spans.
+
+Useful checks:
+
+```bash
+# Count payloads (batch flushes)
+wc -l internal/observability/otel/data/traces.jsonl
+
+# Count root spans (no parent)
+rg -o '"parentSpanId":""' internal/observability/otel/data/traces.jsonl | wc -l
+
+# Count child spans (has parent)
+rg -o '"parentSpanId":"[0-9a-f]+"' internal/observability/otel/data/traces.jsonl | wc -l
+```
+
 ## Suggested env vars for sync workers/apps
 
 - `OTEL_ENABLED=true`

@@ -4,7 +4,7 @@
 import { withSyncSpan } from '@tldraw/sync-core'
 import { WorkerEntrypoint } from 'cloudflare:workers'
 import { AutoRouter, error, type IRequest } from 'itty-router'
-import { extractRequestContext, flushSimpleOtel, initSimpleOtel } from './otel'
+import { extractRequestContext, flushSimpleOtel, initSimpleOtel, injectTraceHeaders } from './otel'
 import type { SimpleSyncWorkerEnvironment } from './SimpleTldrawDurableObject'
 
 export { SimpleTldrawDurableObject } from './SimpleTldrawDurableObject'
@@ -26,7 +26,7 @@ const router = AutoRouter<IRequest, [env: SimpleSyncWorkerEnvironment]>({
 				const id = env.SIMPLE_TLDRAW_DURABLE_OBJECT.idFromName(request.params.roomId)
 				return env.SIMPLE_TLDRAW_DURABLE_OBJECT.get(id).fetch(request.url, {
 					method: request.method,
-					headers: request.headers,
+					headers: injectTraceHeaders(request.headers),
 					body: request.body,
 				})
 			}
