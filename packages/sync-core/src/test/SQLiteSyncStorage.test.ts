@@ -17,7 +17,13 @@ import { DatabaseSync } from 'node:sqlite'
 import { vi } from 'vitest'
 import { MAX_TOMBSTONES, TOMBSTONE_PRUNE_BUFFER_SIZE } from '../lib/InMemorySyncStorage'
 import { NodeSqliteWrapper } from '../lib/NodeSqliteWrapper'
-import { SQLiteSyncStorage } from '../lib/SQLiteSyncStorage'
+import {
+	SQLiteSyncStorage,
+	type TLSqliteInputValue,
+	type TLSqliteRow,
+	type TLSyncSqliteStatement,
+	type TLSyncSqliteWrapper,
+} from '../lib/SQLiteSyncStorage'
 import { RoomSnapshot } from '../lib/TLSyncRoom'
 
 const tlSchema = createTLSchema()
@@ -58,6 +64,54 @@ function createWrapper(config?: { tablePrefix?: string }) {
 function getStorage(snapshot: RoomSnapshot, wrapperConfig?: { tablePrefix?: string }) {
 	const sql = createWrapper(wrapperConfig)
 	return new SQLiteSyncStorage<TLRecord>({ sql, snapshot })
+}
+
+
+class CoercingSqliteWrapper implements TLSyncSqliteWrapper {
+	constructor(
+		private readonly inner: NodeSqliteWrapper,
+		private readonly mode: 'string' | 'arraybuffer'
+	) {}
+
+	prepare<TResult extends TLSqliteRow | void, TParams extends TLSqliteInputValue[] = []>(
+		sql: string
+	): TLSyncSqliteStatement<TResult, TParams> {
+		const stmt = this.inner.prepare<TResult, TParams>(sql)
+		const shouldCoerceState = /SELECT\s+state/i.test(sql)
+
+		const coerceRow = (row: TResult): TResult => {
+			if (!shouldCoerceState || !row || typeof row !== 'object' || !('state' in row)) return row
+			const state = (row as TLSqliteRow).state
+			if (!(state instanceof Uint8Array)) return row
+			if (this.mode === 'string') {
+				return { ...row, state: new TextDecoder().decode(state) } as TResult
+			}
+			const copy = state.slice()
+			return {
+				...row,
+				state: copy.buffer.slice(copy.byteOffset, copy.byteOffset + copy.byteLength),
+			} as TResult
+		}
+
+		return {
+			iterate: (...bindings: TParams) => {
+				const iterator = stmt.iterate(...bindings)
+				return (function* () {
+					for (const row of iterator) yield coerceRow(row)
+				})() as IterableIterator<TResult>
+			},
+			all: (...bindings: TParams) => stmt.all(...bindings).map((row) => coerceRow(row)),
+			run: (...bindings: TParams) => stmt.run(...bindings),
+		}
+	}
+
+	exec(sql: string): void {
+		this.inner.exec(sql)
+	}
+
+	transaction<T>(callback: () => T): T {
+		return this.inner.transaction(callback)
+	}
 }
 
 describe('SQLiteSyncStorage', () => {
@@ -1286,6 +1340,33 @@ describe('SQLiteSyncStorage', () => {
 			const snapshot = storage.getSnapshot()
 			// Should not prune at exactly the threshold
 			expect(Object.keys(snapshot.tombstones!).length).toBe(MAX_TOMBSTONES)
+		})
+	})
+
+	describe('state decoding compatibility', () => {
+		it('reads document state when wrapper returns state as string', () => {
+			const db = new DatabaseSync(':memory:')
+			const baseWrapper = new NodeSqliteWrapper(db)
+			const sql = new CoercingSqliteWrapper(baseWrapper, 'string')
+			const storage = new SQLiteSyncStorage<TLRecord>({ sql, snapshot: makeSnapshot(defaultRecords) })
+
+			storage.transaction((txn) => {
+				const doc = txn.get(TLDOCUMENT_ID)
+				expect(doc?.id).toBe(TLDOCUMENT_ID)
+			})
+		})
+
+		it('reads document state when wrapper returns state as ArrayBuffer', () => {
+			const db = new DatabaseSync(':memory:')
+			const baseWrapper = new NodeSqliteWrapper(db)
+			const sql = new CoercingSqliteWrapper(baseWrapper, 'arraybuffer')
+			const storage = new SQLiteSyncStorage<TLRecord>({ sql, snapshot: makeSnapshot(defaultRecords) })
+
+			storage.transaction((txn) => {
+				const pageId = defaultRecords[1].id
+				const page = txn.get(pageId)
+				expect(page?.id).toBe(pageId)
+			})
 		})
 	})
 

@@ -32,7 +32,7 @@ export type TLSqliteInputValue = null | number | bigint | string | Uint8Array
  * Includes all input types plus Uint8Array for BLOB columns.
  * @public
  */
-export type TLSqliteOutputValue = null | number | bigint | string | Uint8Array
+export type TLSqliteOutputValue = null | number | bigint | string | Uint8Array | ArrayBuffer
 
 /**
  * A row returned from a SQLite query, mapping column names to their values.
@@ -168,7 +168,10 @@ function encodeState(state: unknown): Uint8Array {
 	return textEncoder.encode(JSON.stringify(state))
 }
 
-function decodeState<T>(state: Uint8Array): T {
+function decodeState<T>(state: Uint8Array | ArrayBuffer | string): T {
+	if (typeof state === 'string') {
+		return JSON.parse(state)
+	}
 	return JSON.parse(textDecoder.decode(state))
 }
 
@@ -286,7 +289,7 @@ export class SQLiteSyncStorage<R extends UnknownRecord> implements TLSyncStorage
 			),
 
 			// Documents
-			getDocument: this.sql.prepare<{ state: Uint8Array }, [id: string]>(
+			getDocument: this.sql.prepare<{ state: Uint8Array | ArrayBuffer | string }, [id: string]>(
 				`SELECT state FROM ${documentsTable} WHERE id = ?`
 			),
 			insertDocument: this.sql.prepare<
@@ -299,17 +302,26 @@ export class SQLiteSyncStorage<R extends UnknownRecord> implements TLSyncStorage
 			documentExists: this.sql.prepare<{ id: string }, [id: string]>(
 				`SELECT id FROM ${documentsTable} WHERE id = ?`
 			),
-			iterateDocuments: this.sql.prepare<{ state: Uint8Array; lastChangedClock: number }>(
+			iterateDocuments: this.sql.prepare<{
+				state: Uint8Array | ArrayBuffer | string
+				lastChangedClock: number
+			}>(
 				`SELECT state, lastChangedClock FROM ${documentsTable}`
 			),
-			iterateDocumentEntries: this.sql.prepare<{ id: string; state: Uint8Array }>(
+			iterateDocumentEntries: this.sql.prepare<{
+				id: string
+				state: Uint8Array | ArrayBuffer | string
+			}>(
 				`SELECT id, state FROM ${documentsTable}`
 			),
 			iterateDocumentKeys: this.sql.prepare<{ id: string }>(`SELECT id FROM ${documentsTable}`),
-			iterateDocumentValues: this.sql.prepare<{ state: Uint8Array }>(
+			iterateDocumentValues: this.sql.prepare<{ state: Uint8Array | ArrayBuffer | string }>(
 				`SELECT state FROM ${documentsTable}`
 			),
-			getDocumentsChangedSince: this.sql.prepare<{ state: Uint8Array }, [sinceClock: number]>(
+			getDocumentsChangedSince: this.sql.prepare<
+				{ state: Uint8Array | ArrayBuffer | string },
+				[sinceClock: number]
+			>(
 				`SELECT state FROM ${documentsTable} WHERE lastChangedClock > ?`
 			),
 
