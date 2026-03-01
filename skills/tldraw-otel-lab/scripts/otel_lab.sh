@@ -130,7 +130,9 @@ collector_services_healthy() {
 
 ensure_trace_file() {
   mkdir -p "$STATE_DIR"
+  chmod 0777 "$STATE_DIR" >/dev/null 2>&1 || true
   touch "$TRACE_FILE"
+  chmod 0666 "$TRACE_FILE" >/dev/null 2>&1 || true
   [[ -w "$TRACE_FILE" ]] || fail "Trace file is not writable: $TRACE_FILE"
 }
 

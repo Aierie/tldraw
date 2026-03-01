@@ -1,5 +1,5 @@
 import { expect, test, type Page, type TestInfo } from '@playwright/test'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -108,7 +108,11 @@ function buildTraceOutputFile(testInfo: TestInfo) {
 async function startOtelTraceCapture(testInfo: TestInfo): Promise<OtelTraceCapture> {
 	const outputFile = buildTraceOutputFile(testInfo)
 	await mkdir(path.dirname(outputFile), { recursive: true })
+	// Collector file exporter rotates traces.jsonl, so the directory and file
+	// must be writable even when collector runs under a different UID.
+	await chmod(OTEL_TRACE_OUTPUT_DIR, 0o777).catch(() => {})
 	await writeFile(OTEL_SOURCE_TRACE_FILE, '')
+	await chmod(OTEL_SOURCE_TRACE_FILE, 0o666).catch(() => {})
 	await writeFile(outputFile, '')
 	return {
 		sourceFile: OTEL_SOURCE_TRACE_FILE,

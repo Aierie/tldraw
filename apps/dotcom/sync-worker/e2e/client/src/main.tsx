@@ -6,7 +6,7 @@ import { useSync } from '@tldraw/sync'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { Tldraw } from 'tldraw'
-import 'tldraw/tldraw.css'
+import '../../../../../../packages/tldraw/src/lib/ui.css'
 
 declare global {
 	interface Window {

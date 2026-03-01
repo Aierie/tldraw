@@ -15,7 +15,7 @@ Instrument tldraw sync paths aggressively while keeping traces queryable, hierar
 4. Preserve parent context across adapters and message handlers.
 5. Add explicit outcome attributes on non-exception branches (drop/discard/rebase/forbidden/full/etc.).
 6. Run validation commands in `references/validation-checklist.md`.
-7. For local trace audits, ensure collector is fresh (`corepack yarn otel:down && corepack yarn otel:up`) if `traces.jsonl` appears stuck at zero.
+7. For local trace audits, use `skills/tldraw-otel-lab/scripts/otel_lab.sh up --fresh` so collector health and trace-file permissions are repaired before probing spans.
 
 ## Workflow
 
@@ -67,6 +67,11 @@ Use low-cardinality values for outcome attributes.
 ### 5) Validate aggressively
 
 Run lint + targeted tests for touched paths, then run representative integration tests for sync-core room/socket/client flows. Prefer existing test suites over new snapshots unless behavior changes.
+
+For behavior changes that should be visible in traces, run the targeted simple-sync feedback loop test:
+
+- `corepack yarn workspace @tldraw/dotcom-worker playwright test -c ./e2e/playwright.config.ts ./e2e/tests/simple-sync-worker.spec.ts -g "essential canvas ops write to OTel traces (create/update/group/delete)"`
+- verify `internal/observability/otel/data/traces.jsonl` includes `tlsync.client.push` and `tlsync.client.store_changes`.
 
 If instrumentation touches payload objects, watch for snapshot churn from optional fields (e.g. `trace: undefined`).
 
