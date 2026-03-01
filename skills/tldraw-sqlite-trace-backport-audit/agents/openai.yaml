@@ -1,0 +1,4 @@
+interface:
+  display_name: "tldraw SQLite Trace Audit"
+  short_description: "Diff OTel traces for SQLite backport readiness"
+  default_prompt: "Audit SQLite backport readiness by comparing OTel trace behavior in tldraw-3 against tldraw@4."

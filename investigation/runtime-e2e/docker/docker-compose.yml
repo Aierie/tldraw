@@ -1,0 +1,24 @@
+services:
+  runtime-e2e:
+    build:
+      context: ../../..
+      dockerfile: investigation/runtime-e2e/docker/Dockerfile
+    image: tldraw-runtime-e2e:latest
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    shm_size: "1gb"
+    mem_limit: "7g"
+    cpus: 3
+    environment:
+      CI: "1"
+      YARN_ENABLE_GLOBAL_CACHE: "true"
+      YARN_CACHE_FOLDER: /yarn/cache
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+    volumes:
+      - ../../..:/workspace
+      - tldraw-yarn-cache:/yarn/cache
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  tldraw-yarn-cache:

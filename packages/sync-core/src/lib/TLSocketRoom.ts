@@ -1,12 +1,13 @@
 import type { StoreSchema, UnknownRecord } from '@tldraw/store'
 import { TLStoreSnapshot, createTLSchema } from '@tldraw/tlschema'
 import { objectMapValues, structuredClone } from '@tldraw/utils'
+import { JsonChunkAssembler } from './chunk'
+import { extractTraceContext, withSyncSpan } from './otel'
+import { TLSocketServerSentEvent } from './protocol'
 import { RoomSessionState } from './RoomSession'
 import { ServerSocketAdapter, WebSocketMinimal } from './ServerSocketAdapter'
 import { TLSyncErrorCloseEventReason } from './TLSyncClient'
 import { RoomSnapshot, RoomStoreMethods, TLSyncRoom } from './TLSyncRoom'
-import { JsonChunkAssembler } from './chunk'
-import { TLSocketServerSentEvent } from './protocol'
 
 // TODO: structured logging support
 /** @public */
@@ -120,43 +121,49 @@ export class TLSocketRoom<R extends UnknownRecord = UnknownRecord, SessionMeta =
 			isReadonly?: boolean
 		} & (SessionMeta extends void ? object : { meta: SessionMeta })
 	) {
-		const { sessionId, socket, isReadonly = false } = opts
-		const handleSocketMessage = (event: MessageEvent) =>
-			this.handleSocketMessage(sessionId, event.data)
-		const handleSocketError = this.handleSocketError.bind(this, sessionId)
-		const handleSocketClose = this.handleSocketClose.bind(this, sessionId)
+		withSyncSpan(
+			'tlsync.socket.server.connect',
+			{ attributes: { 'tldraw.room.session_id': opts.sessionId } },
+			() => {
+				const { sessionId, socket, isReadonly = false } = opts
+				const handleSocketMessage = (event: MessageEvent) =>
+					this.handleSocketMessage(sessionId, event.data)
+				const handleSocketError = this.handleSocketError.bind(this, sessionId)
+				const handleSocketClose = this.handleSocketClose.bind(this, sessionId)
 
-		this.sessions.set(sessionId, {
-			assembler: new JsonChunkAssembler(),
-			socket,
-			unlisten: () => {
-				socket.removeEventListener?.('message', handleSocketMessage)
-				socket.removeEventListener?.('close', handleSocketClose)
-				socket.removeEventListener?.('error', handleSocketError)
-			},
-		})
+				this.sessions.set(sessionId, {
+					assembler: new JsonChunkAssembler(),
+					socket,
+					unlisten: () => {
+						socket.removeEventListener?.('message', handleSocketMessage)
+						socket.removeEventListener?.('close', handleSocketClose)
+						socket.removeEventListener?.('error', handleSocketError)
+					},
+				})
 
-		this.room.handleNewSession({
-			sessionId,
-			isReadonly,
-			socket: new ServerSocketAdapter({
-				ws: socket,
-				onBeforeSendMessage: this.opts.onBeforeSendMessage
-					? (message, stringified) =>
-							this.opts.onBeforeSendMessage!({
-								sessionId,
-								message,
-								stringified,
-								meta: this.room.sessions.get(sessionId)?.meta as SessionMeta,
-							})
-					: undefined,
-			}),
-			meta: 'meta' in opts ? (opts.meta as any) : undefined,
-		})
+				this.room.handleNewSession({
+					sessionId,
+					isReadonly,
+					socket: new ServerSocketAdapter({
+						ws: socket,
+						onBeforeSendMessage: this.opts.onBeforeSendMessage
+							? (message, stringified) =>
+									this.opts.onBeforeSendMessage!({
+										sessionId,
+										message,
+										stringified,
+										meta: this.room.sessions.get(sessionId)?.meta as SessionMeta,
+									})
+							: undefined,
+					}),
+					meta: 'meta' in opts ? (opts.meta as any) : undefined,
+				})
 
-		socket.addEventListener?.('message', handleSocketMessage)
-		socket.addEventListener?.('close', handleSocketClose)
-		socket.addEventListener?.('error', handleSocketError)
+				socket.addEventListener?.('message', handleSocketMessage)
+				socket.addEventListener?.('close', handleSocketClose)
+				socket.addEventListener?.('error', handleSocketError)
+			}
+		)
 	}
 
 	/**
@@ -177,26 +184,41 @@ export class TLSocketRoom<R extends UnknownRecord = UnknownRecord, SessionMeta =
 		try {
 			const messageString =
 				typeof message === 'string' ? message : new TextDecoder().decode(message)
-			const res = assembler.handleMessage(messageString)
+			const res = withSyncSpan('tlsync.socket.server.assemble', {}, () =>
+				assembler.handleMessage(messageString)
+			)
 			if (!res) {
 				// not enough chunks yet
 				return
 			}
 			if ('data' in res) {
-				// need to do this first in case the session gets removed as a result of handling the message
-				if (this.opts.onAfterReceiveMessage) {
-					const session = this.room.sessions.get(sessionId)
-					if (session) {
-						this.opts.onAfterReceiveMessage({
-							sessionId,
-							message: res.data as any,
-							stringified: res.stringified,
-							meta: session.meta,
-						})
-					}
-				}
+				const parentContext = extractTraceContext((res.data as any)?.trace)
+				withSyncSpan(
+					'tlsync.socket.server.receive',
+					{
+						attributes: {
+							'tldraw.room.session_id': sessionId,
+							'tldraw.msg.type': (res.data as any).type,
+						},
+					},
+					() => {
+						// need to do this first in case the session gets removed as a result of handling the message
+						if (this.opts.onAfterReceiveMessage) {
+							const session = this.room.sessions.get(sessionId)
+							if (session) {
+								this.opts.onAfterReceiveMessage({
+									sessionId,
+									message: res.data as any,
+									stringified: res.stringified,
+									meta: session.meta,
+								})
+							}
+						}
 
-				this.room.handleMessage(sessionId, res.data as any)
+						this.room.handleMessage(sessionId, res.data as any)
+					},
+					parentContext
+				)
 			} else {
 				this.log?.error?.('Error assembling message', res.error)
 				// close the socket to reset the connection
@@ -216,7 +238,13 @@ export class TLSocketRoom<R extends UnknownRecord = UnknownRecord, SessionMeta =
 	 * @param sessionId - The id of the session. (should match the one used when calling handleSocketConnect)
 	 */
 	handleSocketError(sessionId: string) {
-		this.room.handleClose(sessionId)
+		withSyncSpan(
+			'tlsync.socket.server.error',
+			{ attributes: { 'tldraw.room.session_id': sessionId } },
+			() => {
+				this.room.handleClose(sessionId)
+			}
+		)
 	}
 
 	/**
@@ -225,7 +253,13 @@ export class TLSocketRoom<R extends UnknownRecord = UnknownRecord, SessionMeta =
 	 * @param sessionId - The id of the session. (should match the one used when calling handleSocketConnect)
 	 */
 	handleSocketClose(sessionId: string) {
-		this.room.handleClose(sessionId)
+		withSyncSpan(
+			'tlsync.socket.server.close',
+			{ attributes: { 'tldraw.room.session_id': sessionId } },
+			() => {
+				this.room.handleClose(sessionId)
+			}
+		)
 	}
 
 	/**

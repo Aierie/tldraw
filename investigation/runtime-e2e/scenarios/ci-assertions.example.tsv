@@ -1,0 +1,5 @@
+# pattern<TAB>name<TAB>command
+# pattern is a bash regex tested against full commit ref string
+# * means run for every commit
+*	core-smoke	yarn workspace @tldraw/tldraw test-ci
+^1e9ed3513$	legacy-migration-check	yarn workspace @tldraw/tlschema test-ci

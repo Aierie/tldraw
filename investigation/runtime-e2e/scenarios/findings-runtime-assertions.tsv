@@ -1,0 +1,26 @@
+# pattern	hypothesis_id	assertion_id	class	blocking	command	reason	profiles
+# class: ARCH_ANCHOR | BEHAVIOR | REGRESSION_GUARD | DOTCOM
+# blocking: 1 (required) | 0 (informational)
+
+^1e9ed3513$	h-v3-persistence-path	v3-sync-core-tests	REGRESSION_GUARD	1	[ -d packages/sync-core ] && (cd packages/sync-core && yarn test-ci) || true	Baseline sync-core guard for v3.15.x persistence model	all
+^1e9ed3513$	h-v3-persistence-path	v3-worker-persistence-anchor	ARCH_ANCHOR	1	[ -f apps/dotcom/sync-worker/src/TLDrawDurableObject.ts ] && rg -n "persistToDatabase|triggerPersist|onDataChange" apps/dotcom/sync-worker/src/TLDrawDurableObject.ts	Confirms persistence anchor points still present	all
+
+^d039f3a1a$	h-d039-storage-pivot	d039-storage-contract-tests	REGRESSION_GUARD	1	[ -d packages/sync-core ] && (cd packages/sync-core && yarn test-ci) || true	Storage-contract pivot should preserve sync-core behavior	all
+^d039f3a1a$	h-d039-storage-pivot	d039-storage-migration-scope	ARCH_ANCHOR	1	[ -f packages/store/src/lib/migrate.ts ] && rg -n "scope:\s*'storage'|migrateStorage" packages/store/src/lib/migrate.ts packages/store/src/lib/StoreSchema.ts	Confirms storage-scope migration semantics exist	all
+
+^967d3af52$	h-967-sqlite-rollout	967-sqlite-storage-tests	REGRESSION_GUARD	1	[ -d packages/sync-core ] && (cd packages/sync-core && yarn test-ci) || true	SQLite storage backend introduction should stay green	all
+^967d3af52$	h-967-sqlite-rollout	967-template-sqlite-gating	ARCH_ANCHOR	1	[ -f apps/dotcom/sync-worker/src/TLFileDurableObject.ts ] && rg -n "sqlite_file_storage|SqlLiteSyncStorage|DurableObjectSqliteSyncWrapper" apps/dotcom/sync-worker/src/TLFileDurableObject.ts	Confirms feature-flag gate and sqlite wrapper wiring	all
+
+^d1c72b2b0$	h-d1-text-blob-migration	d1-sqlite-migration-tests	REGRESSION_GUARD	1	[ -d packages/sync-core ] && (cd packages/sync-core && yarn test-ci) || true	TEXT->BLOB migration checkpoint must stay green	all
+^d1c72b2b0$	h-d1-text-blob-migration	d1-blob-encoding-anchor	ARCH_ANCHOR	1	[ -f packages/sync-core/src/lib/SQLiteSyncStorage.ts ] && rg -n "encodeState|decodeState|migrationVersion|CAST\(state AS BLOB\)" packages/sync-core/src/lib/SQLiteSyncStorage.ts	Confirms encoding+migration implementation anchor	all
+
+^d6ff76672$	h-d6-fallback-recovery	d6-storage-fallback-anchor	ARCH_ANCHOR	1	[ -f apps/dotcom/sync-worker/src/TLFileDurableObject.ts ] && rg -n "ROOM_NOT_FOUND|super\.loadStorage|reportError\(" apps/dotcom/sync-worker/src/TLFileDurableObject.ts	Confirms fallback branch and ROOM_NOT_FOUND behavior	all
+^d6ff76672$	h-d6-fallback-recovery	d6-sync-core-tests	REGRESSION_GUARD	1	[ -d packages/sync-core ] && (cd packages/sync-core && yarn test-ci) || true	Fallback/recovery checkpoint still passes sync-core suite	all
+
+^5221da51b$	h-5221-migration-integrity	5221-migration-regression-tests	REGRESSION_GUARD	1	[ -d packages/sync-core ] && (cd packages/sync-core && yarn test-ci) || true	Double-apply migration regression guard	all
+^5221da51b$	h-5221-migration-integrity	5221-staged-update-anchor	ARCH_ANCHOR	1	[ -f packages/store/src/lib/StoreSchema.ts ] && rg -n "updates\s*:\s*\[|storage\.entries\(|for \(const \[id, record\] of updates\)" packages/store/src/lib/StoreSchema.ts	Confirms staged-write migration pattern anchor	all
+
+^95b18b7c3$	h-95-migration-sequencing	95-template-migration-sequencing	ARCH_ANCHOR	1	[ -f templates/sync-cloudflare/wrangler.toml ] && rg -n "new_classes|classes_with_sqlite|tag\s*=\s*\"v2\"" templates/sync-cloudflare/wrangler.toml	Template migration sequencing assertions	all
+
+^266d21c41$	h-266-class-replacement	266-template-class-replacement	ARCH_ANCHOR	1	[ -f templates/sync-cloudflare/wrangler.toml ] && rg -n "TldrawDurableObjectSqlite|new_sqlite_classes|deleted_classes|v2 was a no-op" templates/sync-cloudflare/wrangler.toml	Class replacement migration assertion	all
+^266d21c41$	h-266-class-replacement	266-template-worker-binding	ARCH_ANCHOR	1	[ -f templates/sync-cloudflare/worker/worker.ts ] && rg -n "TldrawDurableObjectSqlite|class_name\s*=\s*\"TldrawDurableObjectSqlite\"" templates/sync-cloudflare/worker/worker.ts templates/sync-cloudflare/wrangler.toml	Binding + export wiring assertion	all

@@ -35,10 +35,8 @@ export class TLUserDurableObject extends DurableObject<Environment> {
 
 	private readonly sentry
 	private captureException(exception: unknown, extras?: Record<string, unknown>) {
-		// eslint-disable-next-line @typescript-eslint/no-deprecated
 		this.sentry?.withScope((scope) => {
 			if (extras) scope.setExtras(extras)
-			// eslint-disable-next-line @typescript-eslint/no-deprecated
 			this.sentry?.captureException(exception) as any
 		})
 		if (!this.sentry) {
@@ -111,7 +109,6 @@ export class TLUserDurableObject extends DurableObject<Environment> {
 			return await this.router.fetch(req)
 		} catch (err) {
 			if (sentry) {
-				// eslint-disable-next-line @typescript-eslint/no-deprecated
 				sentry?.captureException(err)
 			} else {
 				console.error(err)

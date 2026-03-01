@@ -1,0 +1,6 @@
+# pattern	hypothesis_id	expected_status	blocking_on_mismatch	reason	profiles
+# expected_status: PASS | FAIL | MISSING | ANY
+# blocking_on_mismatch: 1 (required) | 0 (informational)
+
+^266d21c41$	h-266-class-replacement	PASS	1	Class replacement hypothesis should stay green	all
+^1e9ed3513$	h-v3-persistence-path	FAIL	0	Known failing checkpoint during migration-suite drift	all

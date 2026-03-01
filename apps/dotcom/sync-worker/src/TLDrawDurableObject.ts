@@ -39,6 +39,7 @@ import { IRequest, Router } from 'itty-router'
 import { Kysely } from 'kysely'
 import { AlarmScheduler } from './AlarmScheduler'
 import { PERSIST_INTERVAL_MS } from './config'
+import { extractRequestContext, flushOtel, getWorkerTracer, initOtel } from './otel'
 import { createPostgresConnectionPool } from './postgres'
 import { getR2KeyForRoom } from './r2'
 import { getPublishedRoomSnapshot } from './routes/tla/getPublishedFile'
@@ -191,6 +192,7 @@ export class TLDrawDurableObject extends DurableObject {
 		override env: Environment
 	) {
 		super(state, env)
+		initOtel(env)
 		this.id = state.id
 		this.storage = state.storage
 		this.sentryDSN = env.SENTRY_DSN
@@ -287,18 +289,37 @@ export class TLDrawDurableObject extends DurableObject {
 	// Handle a request to the Durable Object.
 	override async fetch(req: IRequest) {
 		const sentry = createSentry(this.state, this.env, req)
+		const tracer = getWorkerTracer()
+		const requestContext = extractRequestContext(req.headers)
 
-		try {
-			return await this.router.fetch(req)
-		} catch (err) {
-			console.error(err)
-			// eslint-disable-next-line @typescript-eslint/no-deprecated
-			sentry?.captureException(err)
-			return new Response('Something went wrong', {
-				status: 500,
-				statusText: 'Internal Server Error',
-			})
-		}
+		return tracer.startActiveSpan(
+			'tlsync.worker.do.fetch',
+			{
+				attributes: {
+					'http.request.method': req.method,
+					'http.route': new URL(req.url).pathname,
+				},
+			},
+			requestContext,
+			async (span) => {
+				try {
+					const response = await this.router.fetch(req)
+					span.setAttribute('http.status_code', response.status)
+					return response
+				} catch (err) {
+					console.error(err)
+					sentry?.captureException(err)
+					span.setAttribute('http.status_code', 500)
+					return new Response('Something went wrong', {
+						status: 500,
+						statusText: 'Internal Server Error',
+					})
+				} finally {
+					span.end()
+					await flushOtel()
+				}
+			}
+		)
 	}
 
 	_isRestoring = false
@@ -363,123 +384,139 @@ export class TLDrawDurableObject extends DurableObject {
 	}
 
 	async onRequest(req: IRequest, openMode: RoomOpenMode) {
-		// extract query params from request, should include instanceId
-		const url = new URL(req.url)
-		const params = Object.fromEntries(url.searchParams.entries())
-		let { sessionId, storeId } = params
+		const tracer = getWorkerTracer()
+		const requestContext = extractRequestContext(req.headers)
+		return tracer.startActiveSpan(
+			'tlsync.worker.do.on_request',
+			{
+				attributes: {
+					'tldraw.room_id': this.documentInfo.slug,
+					'http.request.method': req.method,
+				},
+			},
+			requestContext,
+			async (span) => {
+				// extract query params from request, should include instanceId
+				const url = new URL(req.url)
+				const params = Object.fromEntries(url.searchParams.entries())
+				let { sessionId, storeId } = params
 
-		// handle legacy param names
-		sessionId ??= params.sessionKey ?? params.instanceId
-		storeId ??= params.localClientId
-		const isNewSession = !this._room
+				// handle legacy param names
+				sessionId ??= params.sessionKey ?? params.instanceId
+				storeId ??= params.localClientId
+				const isNewSession = !this._room
 
-		// Create the websocket pair for the client
-		const { 0: clientWebSocket, 1: serverWebSocket } = new WebSocketPair()
-		serverWebSocket.accept()
+				// Create the websocket pair for the client
+				const { 0: clientWebSocket, 1: serverWebSocket } = new WebSocketPair()
+				serverWebSocket.accept()
 
-		const closeSocket = (reason: TLSyncErrorCloseEventReason) => {
-			serverWebSocket.close(TLSyncErrorCloseEventCode, reason)
-			return new Response(null, { status: 101, webSocket: clientWebSocket })
-		}
+				const closeSocket = (reason: TLSyncErrorCloseEventReason) => {
+					span.setAttribute('tldraw.outcome', reason)
+					serverWebSocket.close(TLSyncErrorCloseEventCode, reason)
+					return new Response(null, { status: 101, webSocket: clientWebSocket })
+				}
 
-		if (this.documentInfo.deleted) {
-			return closeSocket(TLSyncErrorCloseEventReason.NOT_FOUND)
-		}
-
-		const auth = await getAuth(req, this.env)
-		if (this.documentInfo.isApp) {
-			openMode = ROOM_OPEN_MODE.READ_WRITE
-			const file = await this.getAppFileRecord()
-
-			if (file) {
-				if (file.isDeleted) {
+				if (this.documentInfo.deleted) {
 					return closeSocket(TLSyncErrorCloseEventReason.NOT_FOUND)
 				}
 
-				if (isTestFile(file.id) && !(await canAccessTestProductionFile(this.env, auth))) {
-					return closeSocket(TLSyncErrorCloseEventReason.NOT_FOUND)
-				}
+				const auth = await getAuth(req, this.env)
+				if (this.documentInfo.isApp) {
+					openMode = ROOM_OPEN_MODE.READ_WRITE
+					const file = await this.getAppFileRecord()
 
-				if (!auth && !file.shared) {
-					return closeSocket(TLSyncErrorCloseEventReason.NOT_AUTHENTICATED)
-				}
-				if (auth?.userId) {
-					const rateLimited = await isRateLimited(this.env, auth?.userId)
-					if (rateLimited) {
-						this.logEvent({
-							type: 'client',
-							userId: auth.userId,
-							localClientId: storeId,
-							name: 'rate_limited',
-						})
-						return closeSocket(TLSyncErrorCloseEventReason.RATE_LIMITED)
+					if (file) {
+						if (file.isDeleted) {
+							return closeSocket(TLSyncErrorCloseEventReason.NOT_FOUND)
+						}
+
+						if (isTestFile(file.id) && !(await canAccessTestProductionFile(this.env, auth))) {
+							return closeSocket(TLSyncErrorCloseEventReason.NOT_FOUND)
+						}
+
+						if (!auth && !file.shared) {
+							return closeSocket(TLSyncErrorCloseEventReason.NOT_AUTHENTICATED)
+						}
+						if (auth?.userId) {
+							const rateLimited = await isRateLimited(this.env, auth?.userId)
+							if (rateLimited) {
+								this.logEvent({
+									type: 'client',
+									userId: auth.userId,
+									localClientId: storeId,
+									name: 'rate_limited',
+								})
+								return closeSocket(TLSyncErrorCloseEventReason.RATE_LIMITED)
+							}
+						} else {
+							const rateLimited = await isRateLimited(this.env, sessionId)
+							if (rateLimited) {
+								this.logEvent({
+									type: 'client',
+									userId: auth?.userId,
+									localClientId: storeId,
+									name: 'rate_limited',
+								})
+								return closeSocket(TLSyncErrorCloseEventReason.RATE_LIMITED)
+							}
+						}
+						if (file.ownerId !== auth?.userId) {
+							if (!file.shared) {
+								return closeSocket(TLSyncErrorCloseEventReason.FORBIDDEN)
+							}
+							if (file.sharedLinkType === 'view') {
+								openMode = ROOM_OPEN_MODE.READ_ONLY
+							}
+						}
 					}
 				} else {
-					const rateLimited = await isRateLimited(this.env, sessionId)
-					if (rateLimited) {
+					// Legacy rooms are now read-only
+					openMode = ROOM_OPEN_MODE.READ_ONLY
+				}
+
+				try {
+					const room = await this.getRoom()
+					// Don't connect if we're already at max connections
+					if (room.getNumActiveSessions() > MAX_CONNECTIONS) {
+						return closeSocket(TLSyncErrorCloseEventReason.ROOM_FULL)
+					}
+
+					// all good
+					room.handleSocketConnect({
+						sessionId: sessionId,
+						socket: serverWebSocket,
+						meta: {
+							storeId,
+							userId: auth?.userId ? auth.userId : null,
+						},
+						isReadonly: openMode === ROOM_OPEN_MODE.READ_ONLY,
+					})
+					if (isNewSession) {
 						this.logEvent({
 							type: 'client',
-							userId: auth?.userId,
+							roomId: this.documentInfo.slug,
+							name: 'room_reopen',
+							instanceId: sessionId,
 							localClientId: storeId,
-							name: 'rate_limited',
 						})
-						return closeSocket(TLSyncErrorCloseEventReason.RATE_LIMITED)
 					}
+					this.logEvent({
+						type: 'client',
+						roomId: this.documentInfo.slug,
+						name: 'enter',
+						instanceId: sessionId,
+						localClientId: storeId,
+					})
+					span.setAttribute('tldraw.outcome', 'connected')
+					return new Response(null, { status: 101, webSocket: clientWebSocket })
+				} catch (e) {
+					if (e === ROOM_NOT_FOUND) {
+						return closeSocket(TLSyncErrorCloseEventReason.NOT_FOUND)
+					}
+					throw e
 				}
-				if (file.ownerId !== auth?.userId) {
-					if (!file.shared) {
-						return closeSocket(TLSyncErrorCloseEventReason.FORBIDDEN)
-					}
-					if (file.sharedLinkType === 'view') {
-						openMode = ROOM_OPEN_MODE.READ_ONLY
-					}
-				}
 			}
-		} else {
-			// Legacy rooms are now read-only
-			openMode = ROOM_OPEN_MODE.READ_ONLY
-		}
-
-		try {
-			const room = await this.getRoom()
-			// Don't connect if we're already at max connections
-			if (room.getNumActiveSessions() > MAX_CONNECTIONS) {
-				return closeSocket(TLSyncErrorCloseEventReason.ROOM_FULL)
-			}
-
-			// all good
-			room.handleSocketConnect({
-				sessionId: sessionId,
-				socket: serverWebSocket,
-				meta: {
-					storeId,
-					userId: auth?.userId ? auth.userId : null,
-				},
-				isReadonly: openMode === ROOM_OPEN_MODE.READ_ONLY,
-			})
-			if (isNewSession) {
-				this.logEvent({
-					type: 'client',
-					roomId: this.documentInfo.slug,
-					name: 'room_reopen',
-					instanceId: sessionId,
-					localClientId: storeId,
-				})
-			}
-			this.logEvent({
-				type: 'client',
-				roomId: this.documentInfo.slug,
-				name: 'enter',
-				instanceId: sessionId,
-				localClientId: storeId,
-			})
-			return new Response(null, { status: 101, webSocket: clientWebSocket })
-		} catch (e) {
-			if (e === ROOM_NOT_FOUND) {
-				return closeSocket(TLSyncErrorCloseEventReason.NOT_FOUND)
-			}
-			throw e
-		}
+		)
 	}
 
 	triggerPersistSchedule = throttle(() => {
@@ -726,7 +763,6 @@ export class TLDrawDurableObject extends DurableObject {
 		}
 	}
 	private reportError(e: unknown) {
-		// eslint-disable-next-line @typescript-eslint/no-deprecated
 		this.sentry?.captureException(e)
 		console.error(e)
 	}

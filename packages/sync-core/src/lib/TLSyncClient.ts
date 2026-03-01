@@ -17,12 +17,21 @@ import {
 import { NetworkDiff, RecordOpType, applyObjectDiff, diffRecord, getNetworkDiff } from './diff'
 import { interval } from './interval'
 import {
+	attachTraceCarrier,
+	extractTraceContext,
+	getSyncTraceAttributes,
+	setSafeAttributes,
+	withSyncSpan,
+	withSyncTraceAttributesContext,
+} from './otel'
+import {
 	TLPushRequest,
 	TLSocketClientSentEvent,
 	TLSocketServerSentDataEvent,
 	TLSocketServerSentEvent,
 	getTlsyncProtocolVersion,
 } from './protocol'
+import { summarizeNetworkDiff } from './shapeTelemetry'
 
 /** @internal */
 export type SubscribingFn<T> = (cb: (val: T) => void) => () => void
@@ -105,6 +114,24 @@ export interface TLPersistentClientSocket<R extends UnknownRecord = UnknownRecor
 const PING_INTERVAL = 5000
 const MAX_TIME_TO_WAIT_FOR_SERVER_INTERACTION_BEFORE_RESETTING_CONNECTION = PING_INTERVAL * 2
 
+function summarizeRecordDiff(diff: RecordsDiff<UnknownRecord>) {
+	return {
+		'tldraw.record.added': Object.keys(diff.added).length,
+		'tldraw.record.updated': Object.keys(diff.updated).length,
+		'tldraw.record.removed': Object.keys(diff.removed).length,
+	}
+}
+
+interface PendingPushRequestState<R extends UnknownRecord> {
+	request: TLPushRequest<R>
+	sent: boolean
+	batchId: string
+	queuedAtMs: number
+	coalescedCount: number
+	queueReason: 'document' | 'presence'
+	traceAttrs: Record<string, string>
+}
+
 // Should connect support chunking the response to allow for large payloads?
 
 /**
@@ -120,7 +147,7 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 	private lastServerInteractionTimestamp = Date.now()
 
 	/** The queue of in-flight push requests that have not yet been acknowledged by the server */
-	private pendingPushRequests: { request: TLPushRequest<R>; sent: boolean }[] = []
+	private pendingPushRequests: PendingPushRequestState<R>[] = []
 
 	/**
 	 * The diff of 'unconfirmed', 'optimistic' changes that have been made locally by the user if we
@@ -171,8 +198,26 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 	}
 
 	private readonly presenceType: R['typeName'] | null
+	private readonly telemetryContext:
+		| Record<string, string | number | boolean | undefined>
+		| undefined
+	private nextBatchSequence = 0
 
 	didCancel?: () => boolean
+
+	private getTelemetryAttributes(
+		additional?: Record<string, string | number | boolean | undefined>
+	) {
+		return {
+			...this.telemetryContext,
+			...additional,
+		}
+	}
+
+	private createBatchId(clientClock: number) {
+		const sequence = this.nextBatchSequence++
+		return `${clientClock}-${sequence}`
+	}
 
 	constructor(config: {
 		store: S
@@ -182,8 +227,10 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 		onSyncError(reason: string): void
 		onAfterConnect?(self: TLSyncClient<R, S>, details: { isReadonly: boolean }): void
 		didCancel?(): boolean
+		telemetryContext?: Record<string, string | number | boolean | undefined>
 	}) {
 		this.didCancel = config.didCancel
+		this.telemetryContext = config.telemetryContext
 
 		this.presenceType = config.store.scopedTypes.presence.values().next().value ?? null
 
@@ -225,29 +272,54 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 			// handle switching between online and offline
 			this.socket.onStatusChange((ev) => {
 				if (this.didCancel?.()) return this.close()
-				this.debug('socket status changed', ev.status)
-				if (ev.status === 'online') {
-					this.sendConnectMessage()
-				} else {
-					this.resetConnection()
-					if (ev.status === 'error') {
-						didLoad = true
-						config.onSyncError(ev.reason)
-						this.close()
+				withSyncSpan(
+					'tlsync.client.socket_status_change',
+					{
+						attributes: this.getTelemetryAttributes({
+							...getSyncTraceAttributes(),
+							'tldraw.outcome': ev.status,
+							'tldraw.socket.status': ev.status,
+						}),
+					},
+					() => {
+						this.debug('socket status changed', ev.status)
+						if (ev.status === 'online') {
+							this.sendConnectMessage()
+						} else {
+							this.resetConnection()
+							if (ev.status === 'error') {
+								didLoad = true
+								config.onSyncError(ev.reason)
+								this.close()
+							}
+						}
 					}
-				}
+				)
 			}),
 			// Send a ping every PING_INTERVAL ms while online
 			interval(() => {
 				if (this.didCancel?.()) return this.close()
 				this.debug('ping loop', { isConnectedToRoom: this.isConnectedToRoom })
 				if (!this.isConnectedToRoom) return
-				try {
-					this.socket.sendMessage({ type: 'ping' })
-				} catch (error) {
-					console.warn('ping failed, resetting', error)
-					this.resetConnection()
-				}
+				withSyncSpan(
+					'tlsync.client.ping',
+					{
+						attributes: this.getTelemetryAttributes({
+							...getSyncTraceAttributes(),
+							'tldraw.msg.type': 'ping',
+							'tldraw.client.last_server_interaction_ms':
+								Date.now() - this.lastServerInteractionTimestamp,
+						}),
+					},
+					() => {
+						try {
+							this.socket.sendMessage(attachTraceCarrier({ type: 'ping' }))
+						} catch (error) {
+							console.warn('ping failed, resetting', error)
+							this.resetConnection()
+						}
+					}
+				)
 			}, PING_INTERVAL),
 			// Check the server connection health, reset the connection if needed
 			interval(() => {
@@ -293,41 +365,66 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 	 * to wait for the response before this client can be used.
 	 */
 	private sendConnectMessage() {
-		if (this.isConnectedToRoom) {
-			console.error('sendConnectMessage called while already connected')
-			return
-		}
-		this.debug('sending connect message')
-		this.latestConnectRequestId = uniqueId()
-		this.socket.sendMessage({
-			type: 'connect',
-			connectRequestId: this.latestConnectRequestId,
-			schema: this.store.schema.serialize(),
-			protocolVersion: getTlsyncProtocolVersion(),
-			lastServerClock: this.lastServerClock,
-		})
+		withSyncSpan(
+			'tlsync.client.connect',
+			{
+				attributes: this.getTelemetryAttributes({
+					...getSyncTraceAttributes(),
+					'tldraw.msg.type': 'connect',
+					'tldraw.client.last_server_clock': this.lastServerClock,
+				}),
+			},
+			() => {
+				if (this.isConnectedToRoom) {
+					console.error('sendConnectMessage called while already connected')
+					return
+				}
+				this.debug('sending connect message')
+				this.latestConnectRequestId = uniqueId()
+				this.socket.sendMessage(
+					attachTraceCarrier({
+						type: 'connect',
+						connectRequestId: this.latestConnectRequestId,
+						schema: this.store.schema.serialize(),
+						protocolVersion: getTlsyncProtocolVersion(),
+						lastServerClock: this.lastServerClock,
+					})
+				)
+			}
+		)
 	}
 
 	/** Switch to offline mode */
 	private resetConnection(hard = false) {
-		this.debug('resetting connection')
-		if (hard) {
-			this.lastServerClock = 0
-		}
-		// kill all presence state
-		const keys = Object.keys(this.store.serialize('presence')) as any
-		if (keys.length > 0) {
-			this.store.mergeRemoteChanges(() => {
-				this.store.remove(keys)
-			})
-		}
-		this.lastPushedPresenceState = null
-		this.isConnectedToRoom = false
-		this.pendingPushRequests = []
-		this.incomingDiffBuffer = []
-		if (this.socket.connectionStatus === 'online') {
-			this.socket.restart()
-		}
+		withSyncSpan(
+			'tlsync.client.reset_connection',
+			{
+				attributes: this.getTelemetryAttributes({
+					...getSyncTraceAttributes(),
+					'tldraw.outcome': hard ? 'hard' : 'soft',
+				}),
+			},
+			() => {
+				this.debug('resetting connection')
+				if (hard) {
+					this.lastServerClock = 0
+				}
+				// kill all presence state
+				const keys = Object.keys(this.store.serialize('presence')) as any
+				if (keys.length > 0) {
+					this.store.mergeRemoteChanges(() => {
+						this.store.remove(keys)
+					})
+				}
+				this.lastPushedPresenceState = null
+				this.isConnectedToRoom = false
+				this.pendingPushRequests = []
+				this.incomingDiffBuffer = []
+				if (this.socket.connectionStatus === 'online') {
+					this.socket.restart()
+				}
+			}
+		)
 	}
 
 	/**
@@ -411,36 +508,51 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 
 	/** Handle events received from the server */
 	private handleServerEvent(event: TLSocketServerSentEvent<R>) {
-		this.debug('received server event', event)
-		this.lastServerInteractionTimestamp = Date.now()
-		// always update the lastServerClock when it is present
-		switch (event.type) {
-			case 'connect':
-				this.didReconnect(event)
-				break
-			// legacy v4 events
-			case 'patch':
-			case 'push_result':
-				if (!this.isConnectedToRoom) break
-				this.incomingDiffBuffer.push(event)
-				this.scheduleRebase()
-				break
-			case 'data':
-				// wait for a connect to succeed before processing more events
-				if (!this.isConnectedToRoom) break
-				this.incomingDiffBuffer.push(...event.data)
-				this.scheduleRebase()
-				break
-			case 'incompatibility_error':
-				// legacy unrecoverable errors
-				console.error('incompatibility error is legacy and should no longer be sent by the server')
-				break
-			case 'pong':
-				// noop, we only use ping/pong to set lastSeverInteractionTimestamp
-				break
-			default:
-				exhaustiveSwitchError(event)
-		}
+		const parentContext = extractTraceContext(event.trace)
+		withSyncSpan(
+			'tlsync.client.receive',
+			{
+				attributes: this.getTelemetryAttributes({
+					...getSyncTraceAttributes(parentContext),
+					'tldraw.msg.type': event.type,
+				}),
+			},
+			() => {
+				this.debug('received server event', event)
+				this.lastServerInteractionTimestamp = Date.now()
+				// always update the lastServerClock when it is present
+				switch (event.type) {
+					case 'connect':
+						this.didReconnect(event)
+						break
+					// legacy v4 events
+					case 'patch':
+					case 'push_result':
+						if (!this.isConnectedToRoom) break
+						this.incomingDiffBuffer.push(event)
+						this.scheduleRebase()
+						break
+					case 'data':
+						// wait for a connect to succeed before processing more events
+						if (!this.isConnectedToRoom) break
+						this.incomingDiffBuffer.push(...event.data)
+						this.scheduleRebase()
+						break
+					case 'incompatibility_error':
+						// legacy unrecoverable errors
+						console.error(
+							'incompatibility error is legacy and should no longer be sent by the server'
+						)
+						break
+					case 'pong':
+						// noop, we only use ping/pong to set lastSeverInteractionTimestamp
+						break
+					default:
+						exhaustiveSwitchError(event)
+				}
+			},
+			parentContext
+		)
 	}
 
 	close() {
@@ -453,86 +565,146 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 	lastPushedPresenceState: R | null = null
 
 	private pushPresence(nextPresence: R | null) {
-		// make sure we push any document changes first
-		this.store._flushHistory()
+		withSyncSpan(
+			'tlsync.client.push_presence',
+			{
+				attributes: this.getTelemetryAttributes({
+					...getSyncTraceAttributes(),
+					'tldraw.has_presence': !!nextPresence,
+					'tldraw.client.is_connected': this.isConnectedToRoom,
+				}),
+			},
+			() => {
+				// make sure we push any document changes first
+				this.store._flushHistory()
 
-		if (!this.isConnectedToRoom) {
-			// if we're offline, don't do anything
-			return
-		}
+				if (!this.isConnectedToRoom) {
+					// if we're offline, don't do anything
+					return
+				}
 
-		let presence: TLPushRequest<any>['presence'] = undefined
-		if (!this.lastPushedPresenceState && nextPresence) {
-			// we don't have a last presence state, so we need to push the full state
-			presence = [RecordOpType.Put, nextPresence]
-		} else if (this.lastPushedPresenceState && nextPresence) {
-			// we have a last presence state, so we need to push a diff if there is one
-			const diff = diffRecord(this.lastPushedPresenceState, nextPresence)
-			if (diff) {
-				presence = [RecordOpType.Patch, diff]
+				let presence: TLPushRequest<any>['presence'] = undefined
+				if (!this.lastPushedPresenceState && nextPresence) {
+					// we don't have a last presence state, so we need to push the full state
+					presence = [RecordOpType.Put, nextPresence]
+				} else if (this.lastPushedPresenceState && nextPresence) {
+					// we have a last presence state, so we need to push a diff if there is one
+					const diff = diffRecord(this.lastPushedPresenceState, nextPresence)
+					if (diff) {
+						presence = [RecordOpType.Patch, diff]
+					}
+				}
+
+				if (!presence) return
+				this.lastPushedPresenceState = nextPresence
+
+				// if there is a pending push that has not been sent and does not already include a presence update,
+				// then add this presence update to it
+				const lastPush = this.pendingPushRequests.at(-1)
+				if (lastPush && !lastPush.sent && !lastPush.request.presence) {
+					lastPush.request.presence = presence
+					lastPush.coalescedCount += 1
+					return
+				}
+
+				// otherwise, create a new push request
+				const req: TLPushRequest<R> = {
+					type: 'push',
+					clientClock: this.clientClock++,
+					presence,
+				}
+
+				const traceAttrs = getSyncTraceAttributes()
+				const batchId = this.createBatchId(req.clientClock)
+				this.pendingPushRequests.push({
+					request: req,
+					sent: false,
+					batchId,
+					queuedAtMs: Date.now(),
+					coalescedCount: 1,
+					queueReason: 'presence',
+					traceAttrs,
+				})
+				this.flushPendingPushRequests()
 			}
-		}
-
-		if (!presence) return
-		this.lastPushedPresenceState = nextPresence
-
-		// if there is a pending push that has not been sent and does not already include a presence update,
-		// then add this presence update to it
-		const lastPush = this.pendingPushRequests.at(-1)
-		if (lastPush && !lastPush.sent && !lastPush.request.presence) {
-			lastPush.request.presence = presence
-			return
-		}
-
-		// otherwise, create a new push request
-		const req: TLPushRequest<R> = {
-			type: 'push',
-			clientClock: this.clientClock++,
-			presence,
-		}
-
-		if (req) {
-			this.pendingPushRequests.push({ request: req, sent: false })
-			this.flushPendingPushRequests()
-		}
+		)
 	}
 
 	/** Push a change to the server, or stash it locally if we're offline */
 	private push(change: RecordsDiff<any>) {
-		this.debug('push', change)
-		// the Store doesn't do deep equality checks when making changes
-		// so it's possible that the diff passed in here is actually a no-op.
-		// either way, we also don't want to send whole objects over the wire if
-		// only small parts of them have changed, so we'll do a shallow-ish diff
-		// which also uses deep equality checks to see if the change is actually
-		// a no-op.
-		const diff = getNetworkDiff(change)
-		if (!diff) return
+		const traceAttrs = getSyncTraceAttributes()
+		withSyncSpan(
+			'tlsync.client.store_changes',
+			{
+				attributes: this.getTelemetryAttributes({
+					...traceAttrs,
+					'tldraw.msg.type': 'push',
+					'tldraw.client.is_connected': this.isConnectedToRoom,
+					...summarizeRecordDiff(change as RecordsDiff<UnknownRecord>),
+				}),
+			},
+			() => {
+				this.debug('push', change)
+				// the Store doesn't do deep equality checks when making changes
+				// so it's possible that the diff passed in here is actually a no-op.
+				// either way, we also don't want to send whole objects over the wire if
+				// only small parts of them have changed, so we'll do a shallow-ish diff
+				// which also uses deep equality checks to see if the change is actually
+				// a no-op.
+				const diff = getNetworkDiff(change)
+				if (!diff) return
 
-		// the change is not a no-op so we'll send it to the server
-		// but first let's merge the records diff into the speculative changes
-		this.speculativeChanges = squashRecordDiffs([this.speculativeChanges, change])
+				// the change is not a no-op so we'll send it to the server
+				// but first let's merge the records diff into the speculative changes
+				this.speculativeChanges = squashRecordDiffs([this.speculativeChanges, change])
 
-		if (!this.isConnectedToRoom) {
-			// don't sent push requests or even store them up while offline
-			// when we come back online we'll generate another push request from
-			// scratch based on the speculativeChanges diff
-			return
-		}
+				if (!this.isConnectedToRoom) {
+					// don't sent push requests or even store them up while offline
+					// when we come back online we'll generate another push request from
+					// scratch based on the speculativeChanges diff
+					return
+				}
 
-		const pushRequest: TLPushRequest<R> = {
-			type: 'push',
-			diff,
-			clientClock: this.clientClock++,
-		}
+				const pushRequest: TLPushRequest<R> = {
+					type: 'push',
+					diff,
+					clientClock: this.clientClock++,
+				}
+				const batchId = this.createBatchId(pushRequest.clientClock)
+				const pendingPushRequest: PendingPushRequestState<R> = {
+					request: pushRequest,
+					sent: false,
+					batchId,
+					queuedAtMs: Date.now(),
+					coalescedCount: 1,
+					queueReason: 'document',
+					traceAttrs,
+				}
+				this.pendingPushRequests.push(pendingPushRequest)
+				withSyncSpan(
+					'tlsync.client.queue_push',
+					{
+						attributes: this.getTelemetryAttributes({
+							...traceAttrs,
+							'tldraw.msg.type': pushRequest.type,
+							'tldraw.outcome': 'queued',
+							'tldraw.client.clock': pushRequest.clientClock,
+							'tldraw.client.is_connected': this.isConnectedToRoom,
+							'tldraw.sync.batch_id': batchId,
+							'tldraw.sync.batch_coalesced_count': pendingPushRequest.coalescedCount,
+							...summarizeRecordDiff(change as RecordsDiff<UnknownRecord>),
+						}),
+					},
+					() => {}
+				)
 
-		this.pendingPushRequests.push({ request: pushRequest, sent: false })
-
-		// immediately calling .send on the websocket here was causing some interaction
-		// slugishness when e.g. drawing or translating shapes. Seems like it blocks
-		// until the send completes. So instead we'll schedule a send to happen on some
-		// tick in the near future.
-		this.flushPendingPushRequests()
+				// immediately calling .send on the websocket here was causing some interaction
+				// slugishness when e.g. drawing or translating shapes. Seems like it blocks
+				// until the send completes. So instead we'll schedule a send to happen on some
+				// tick in the near future.
+				this.flushPendingPushRequests()
+			}
+		)
 	}
 
 	/** Send any unsent push requests to the server */
@@ -550,7 +722,34 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 					// we went offline, so don't send anything
 					return
 				}
-				this.socket.sendMessage(pendingPushRequest.request)
+				const sendContext = withSyncTraceAttributesContext({
+					...pendingPushRequest.traceAttrs,
+					'tldraw.sync.batch_id': pendingPushRequest.batchId,
+					'tldraw.sync.batch_coalesced_count': pendingPushRequest.coalescedCount,
+				})
+				withSyncSpan(
+					'tlsync.client.push',
+					{
+						attributes: this.getTelemetryAttributes({
+							...pendingPushRequest.traceAttrs,
+							'tldraw.msg.type': pendingPushRequest.request.type,
+							'tldraw.client.clock': pendingPushRequest.request.clientClock,
+							'tldraw.sync.batch_id': pendingPushRequest.batchId,
+							'tldraw.sync.batch_coalesced_count': pendingPushRequest.coalescedCount,
+							'tldraw.sync.flush_reason': pendingPushRequest.queueReason,
+							'tldraw.client.queue_wait_ms': Date.now() - pendingPushRequest.queuedAtMs,
+							...summarizeNetworkDiff(pendingPushRequest.request.diff),
+						}),
+					},
+					(span) => {
+						this.socket.sendMessage(attachTraceCarrier(pendingPushRequest.request))
+						setSafeAttributes(span, {
+							'tldraw.outcome': 'sent',
+							'tlsync.pending_push.count': this.pendingPushRequests.length,
+						})
+					},
+					sendContext
+				)
 				pendingPushRequest.sent = true
 			}
 		}
@@ -599,67 +798,81 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 
 	// eslint-disable-next-line local/prefer-class-methods
 	private rebase = () => {
-		// need to make sure that our speculative changes are in sync with the actual store instance before
-		// proceeding, to avoid inconsistency bugs.
-		this.store._flushHistory()
-		if (this.incomingDiffBuffer.length === 0) return
+		return withSyncSpan(
+			'tlsync.client.rebase',
+			{
+				attributes: this.getTelemetryAttributes({
+					...getSyncTraceAttributes(),
+					'tldraw.client.pending_incoming_diffs': this.incomingDiffBuffer.length,
+					'tldraw.client.pending_pushes': this.pendingPushRequests.length,
+				}),
+			},
+			() => {
+				// need to make sure that our speculative changes are in sync with the actual store instance before
+				// proceeding, to avoid inconsistency bugs.
+				this.store._flushHistory()
+				if (this.incomingDiffBuffer.length === 0) return
 
-		const diffs = this.incomingDiffBuffer
-		this.incomingDiffBuffer = []
+				const diffs = this.incomingDiffBuffer
+				this.incomingDiffBuffer = []
 
-		try {
-			this.store.mergeRemoteChanges(() => {
-				// first undo speculative changes
-				this.store.applyDiff(reverseRecordsDiff(this.speculativeChanges), { runCallbacks: false })
-
-				// then apply network diffs on top of known-to-be-synced data
-				for (const diff of diffs) {
-					if (diff.type === 'patch') {
-						this.applyNetworkDiff(diff.diff, true)
-						continue
-					}
-					// handling push_result
-					if (this.pendingPushRequests.length === 0) {
-						throw new Error('Received push_result but there are no pending push requests')
-					}
-					if (this.pendingPushRequests[0].request.clientClock !== diff.clientClock) {
-						throw new Error(
-							'Received push_result for a push request that is not at the front of the queue'
-						)
-					}
-					if (diff.action === 'discard') {
-						this.pendingPushRequests.shift()
-					} else if (diff.action === 'commit') {
-						const { request } = this.pendingPushRequests.shift()!
-						if ('diff' in request && request.diff) {
-							this.applyNetworkDiff(request.diff, true)
-						}
-					} else {
-						this.applyNetworkDiff(diff.action.rebaseWithDiff, true)
-						this.pendingPushRequests.shift()
-					}
-				}
-				// update the speculative diff while re-applying pending changes
 				try {
-					this.speculativeChanges = this.store.extractingChanges(() => {
-						for (const { request } of this.pendingPushRequests) {
-							if (!('diff' in request) || !request.diff) continue
-							this.applyNetworkDiff(request.diff, true)
+					this.store.mergeRemoteChanges(() => {
+						// first undo speculative changes
+						this.store.applyDiff(reverseRecordsDiff(this.speculativeChanges), {
+							runCallbacks: false,
+						})
+
+						// then apply network diffs on top of known-to-be-synced data
+						for (const diff of diffs) {
+							if (diff.type === 'patch') {
+								this.applyNetworkDiff(diff.diff, true)
+								continue
+							}
+							// handling push_result
+							if (this.pendingPushRequests.length === 0) {
+								throw new Error('Received push_result but there are no pending push requests')
+							}
+							if (this.pendingPushRequests[0].request.clientClock !== diff.clientClock) {
+								throw new Error(
+									'Received push_result for a push request that is not at the front of the queue'
+								)
+							}
+							if (diff.action === 'discard') {
+								this.pendingPushRequests.shift()
+							} else if (diff.action === 'commit') {
+								const { request } = this.pendingPushRequests.shift()!
+								if ('diff' in request && request.diff) {
+									this.applyNetworkDiff(request.diff, true)
+								}
+							} else {
+								this.applyNetworkDiff(diff.action.rebaseWithDiff, true)
+								this.pendingPushRequests.shift()
+							}
+						}
+						// update the speculative diff while re-applying pending changes
+						try {
+							this.speculativeChanges = this.store.extractingChanges(() => {
+								for (const { request } of this.pendingPushRequests) {
+									if (!('diff' in request) || !request.diff) continue
+									this.applyNetworkDiff(request.diff, true)
+								}
+							})
+						} catch (e) {
+							console.error(e)
+							// throw away the speculative changes and start over
+							this.speculativeChanges = { added: {} as any, updated: {} as any, removed: {} as any }
+							this.resetConnection()
 						}
 					})
+					this.lastServerClock = diffs.at(-1)?.serverClock ?? this.lastServerClock
 				} catch (e) {
 					console.error(e)
-					// throw away the speculative changes and start over
-					this.speculativeChanges = { added: {} as any, updated: {} as any, removed: {} as any }
+					this.store.ensureStoreIsUsable()
 					this.resetConnection()
 				}
-			})
-			this.lastServerClock = diffs.at(-1)?.serverClock ?? this.lastServerClock
-		} catch (e) {
-			console.error(e)
-			this.store.ensureStoreIsUsable()
-			this.resetConnection()
-		}
+			}
+		)
 	}
 
 	private scheduleRebase = fpsThrottle(this.rebase)

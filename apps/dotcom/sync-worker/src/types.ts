@@ -60,6 +60,11 @@ export interface Environment {
 	WORKER_NAME: string | undefined
 	ASSET_UPLOAD_ORIGIN: string | undefined
 	MULTIPLAYER_SERVER: string | undefined
+	OTEL_ENABLED: string | undefined
+	OTEL_SERVICE_NAME: string | undefined
+	OTEL_EXPORTER_OTLP_ENDPOINT: string | undefined
+	OTEL_SAMPLE_RATIO: string | undefined
+	OTEL_EXPORTER_OTLP_HEADERS: string | undefined
 
 	HEALTH_CHECK_BEARER_TOKEN: string | undefined
 

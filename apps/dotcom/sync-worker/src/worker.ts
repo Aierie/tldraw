@@ -26,6 +26,7 @@ import {
 import { adminRoutes } from './adminRoutes'
 import { POSTHOG_URL } from './config'
 import { healthCheckRoutes } from './healthCheckRoutes'
+import { extractRequestContext, flushOtel, getWorkerTracer, initOtel } from './otel'
 import { createPostgresConnectionPool, makePostgresConnector } from './postgres'
 import { createRoomSnapshot } from './routes/createRoomSnapshot'
 import { extractBookmarkMetadata } from './routes/extractBookmarkMetadata'
@@ -58,6 +59,7 @@ const QUEUE_BASE_DELAY = 2
 const router = createRouter<Environment>()
 	.all('*', preflight)
 	.all('*', blockUnknownOrigins)
+	.get('/health', () => new Response('ok'))
 	.post('/snapshots', createRoomSnapshot)
 	.get('/snapshot/:roomId', getRoomSnapshot)
 	.get(`/${ROOM_PREFIX}/:roomId`, (req, env) =>
@@ -167,6 +169,9 @@ const router = createRouter<Environment>()
 
 export default class Worker extends WorkerEntrypoint<Environment> {
 	override async fetch(request: Request): Promise<Response> {
+		initOtel(this.env)
+		const tracer = getWorkerTracer()
+		const requestContext = extractRequestContext(request.headers)
 		// if we get a request that starts with /api/, strip it before handling.
 		const url = new URL(request.url)
 		const pathname = url.pathname.replace(/^\/api\//, '/')
@@ -175,37 +180,55 @@ export default class Worker extends WorkerEntrypoint<Environment> {
 			request = new Request(url.toString(), request)
 		}
 
-		return await handleApiRequest({
-			router,
-			request,
-			env: this.env,
-			ctx: this.ctx,
-			after: (response) => {
-				const setCookies = response.headers.getAll('set-cookie')
-				// unfortunately corsify mishandles the set-cookie header, so
-				// we need to manually add it back in
-				const result = corsify(response)
-				if ([...setCookies].length === 0) {
-					return result
-				}
-				const newResponse = new Response(result.body, result)
-				newResponse.headers.delete('set-cookie')
-				// add cookies from original response
-				for (const cookie of setCookies) {
-					newResponse.headers.append('set-cookie', cookie)
-				}
-				return newResponse
+		return tracer.startActiveSpan(
+			'tlsync.worker.fetch',
+			{
+				attributes: {
+					'http.request.method': request.method,
+					'http.route': pathname,
+				},
 			},
-		}).catch((err) => {
-			const sentry = createSentry(this.ctx, this.env, request)
-			if (sentry) {
-				// eslint-disable-next-line @typescript-eslint/no-deprecated
-				sentry.captureException(err)
-			} else {
-				console.error(err)
+			requestContext,
+			async (span) => {
+				try {
+					const response = await handleApiRequest({
+						router,
+						request,
+						env: this.env,
+						ctx: this.ctx,
+						after: (response) => {
+							const setCookies = response.headers.getAll('set-cookie')
+							// unfortunately corsify mishandles the set-cookie header, so
+							// we need to manually add it back in
+							const result = corsify(response)
+							if ([...setCookies].length === 0) {
+								return result
+							}
+							const newResponse = new Response(result.body, result)
+							newResponse.headers.delete('set-cookie')
+							// add cookies from original response
+							for (const cookie of setCookies) {
+								newResponse.headers.append('set-cookie', cookie)
+							}
+							return newResponse
+						},
+					})
+					span.setAttribute('http.status_code', response.status)
+					return response
+				} catch (err) {
+					const sentry = createSentry(this.ctx, this.env, request)
+					if (sentry) {
+						sentry.captureException(err)
+					} else {
+						console.error(err)
+					}
+					throw err
+				} finally {
+					span.end()
+					await flushOtel()
+				}
 			}
-			throw err
-		})
+		)
 	}
 
 	override async queue(batch: MessageBatch<QueueMessage>): Promise<void> {

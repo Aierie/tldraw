@@ -2,6 +2,7 @@ import { atom, Atom } from '@tldraw/state'
 import { TLRecord } from '@tldraw/tlschema'
 import { assert, warnOnce } from '@tldraw/utils'
 import { chunk } from './chunk'
+import { attachTraceCarrier, extractTraceContext, withSyncSpan } from './otel'
 import { TLSocketClientSentEvent, TLSocketServerSentEvent } from './protocol'
 import {
 	TLPersistentClientSocket,
@@ -64,12 +65,14 @@ export class ClientWebSocketAdapter implements TLPersistentClientSocket<TLRecord
 	}
 
 	private _handleConnect() {
-		debug('handleConnect')
+		withSyncSpan('tlsync.socket.client.connected', {}, () => {
+			debug('handleConnect')
 
-		this._connectionStatus.set('online')
-		this.statusListeners.forEach((cb) => cb({ status: 'online' }))
+			this._connectionStatus.set('online')
+			this.statusListeners.forEach((cb) => cb({ status: 'online' }))
 
-		this._reconnectManager.connected()
+			this._reconnectManager.connected()
+		})
 	}
 
 	private _handleDisconnect(
@@ -78,47 +81,63 @@ export class ClientWebSocketAdapter implements TLPersistentClientSocket<TLRecord
 		didOpen?: boolean,
 		closeReason?: string
 	) {
-		closeReason = closeReason || TLSyncErrorCloseEventReason.UNKNOWN_ERROR
+		withSyncSpan(
+			'tlsync.socket.client.disconnected',
+			{
+				attributes: {
+					'tlsync.close.code': closeCode ?? -1,
+					'tlsync.close.reason': closeReason ?? TLSyncErrorCloseEventReason.UNKNOWN_ERROR,
+					'tldraw.outcome': reason,
+				},
+			},
+			() => {
+				closeReason = closeReason || TLSyncErrorCloseEventReason.UNKNOWN_ERROR
 
-		debug('handleDisconnect', {
-			currentStatus: this.connectionStatus,
-			closeCode,
-			reason,
-		})
+				debug('handleDisconnect', {
+					currentStatus: this.connectionStatus,
+					closeCode,
+					reason,
+				})
 
-		let newStatus: 'offline' | 'error'
-		switch (reason) {
-			case 'closed':
-				if (closeCode === TLSyncErrorCloseEventCode) {
-					newStatus = 'error'
-				} else {
-					newStatus = 'offline'
+				let newStatus: 'offline' | 'error'
+				switch (reason) {
+					case 'closed':
+						if (closeCode === TLSyncErrorCloseEventCode) {
+							newStatus = 'error'
+						} else {
+							newStatus = 'offline'
+						}
+						break
+					case 'manual':
+						newStatus = 'offline'
+						break
 				}
-				break
-			case 'manual':
-				newStatus = 'offline'
-				break
-		}
 
-		if (closeCode === 1006 && !didOpen) {
-			warnOnce(
-				"Could not open WebSocket connection. This might be because you're trying to load a URL that doesn't support websockets. Check the URL you're trying to connect to."
-			)
-		}
+				if (closeCode === 1006 && !didOpen) {
+					warnOnce(
+						"Could not open WebSocket connection. This might be because you're trying to load a URL that doesn't support websockets. Check the URL you're trying to connect to."
+					)
+				}
 
-		if (
-			// it the status changed
-			this.connectionStatus !== newStatus &&
-			// ignore errors if we're already in the offline state
-			!(newStatus === 'error' && this.connectionStatus === 'offline')
-		) {
-			this._connectionStatus.set(newStatus)
-			this.statusListeners.forEach((cb) =>
-				cb(newStatus === 'error' ? { status: 'error', reason: closeReason } : { status: newStatus })
-			)
-		}
+				if (
+					// it the status changed
+					this.connectionStatus !== newStatus &&
+					// ignore errors if we're already in the offline state
+					!(newStatus === 'error' && this.connectionStatus === 'offline')
+				) {
+					this._connectionStatus.set(newStatus)
+					this.statusListeners.forEach((cb) =>
+						cb(
+							newStatus === 'error'
+								? { status: 'error', reason: closeReason }
+								: { status: newStatus }
+						)
+					)
+				}
 
-		this._reconnectManager.disconnected()
+				this._reconnectManager.disconnected()
+			}
+		)
 	}
 
 	_setNewSocket(ws: WebSocket) {
@@ -137,37 +156,68 @@ export class ClientWebSocketAdapter implements TLPersistentClientSocket<TLRecord
 		//       timeout, but in either case those sockets don't need any special handling, the browser
 		//       will close them eventually. We just "orphan" such sockets and ignore their onclose/onerror.
 		ws.onopen = () => {
-			debug('ws.onopen')
-			assert(
-				this._ws === ws,
-				"sockets must only be orphaned when they are CLOSING or CLOSED, so they can't open"
-			)
-			didOpen = true
-			this._handleConnect()
+			withSyncSpan('tlsync.socket.client.onopen', {}, () => {
+				debug('ws.onopen')
+				assert(
+					this._ws === ws,
+					"sockets must only be orphaned when they are CLOSING or CLOSED, so they can't open"
+				)
+				didOpen = true
+				this._handleConnect()
+			})
 		}
 		ws.onclose = (event: CloseEvent) => {
-			debug('ws.onclose', event)
-			if (this._ws === ws) {
-				this._handleDisconnect('closed', event.code, didOpen, event.reason)
-			} else {
-				debug('ignoring onclose for an orphaned socket')
-			}
+			withSyncSpan(
+				'tlsync.socket.client.onclose',
+				{
+					attributes: {
+						'tlsync.close.code': event.code,
+						'tlsync.close.reason': event.reason || TLSyncErrorCloseEventReason.UNKNOWN_ERROR,
+					},
+				},
+				() => {
+					debug('ws.onclose', event)
+					if (this._ws === ws) {
+						this._handleDisconnect('closed', event.code, didOpen, event.reason)
+					} else {
+						debug('ignoring onclose for an orphaned socket')
+					}
+				}
+			)
 		}
 		ws.onerror = (event) => {
-			debug('ws.onerror', event)
-			if (this._ws === ws) {
-				this._handleDisconnect('closed')
-			} else {
-				debug('ignoring onerror for an orphaned socket')
-			}
+			withSyncSpan('tlsync.socket.client.onerror', {}, () => {
+				debug('ws.onerror', event)
+				if (this._ws === ws) {
+					this._handleDisconnect('closed')
+				} else {
+					debug('ignoring onerror for an orphaned socket')
+				}
+			})
 		}
 		ws.onmessage = (ev) => {
 			assert(
 				this._ws === ws,
 				"sockets must only be orphaned when they are CLOSING or CLOSED, so they can't receive messages"
 			)
-			const parsed = JSON.parse(ev.data.toString())
-			this.messageListeners.forEach((cb) => cb(parsed))
+			const parsed = withSyncSpan('tlsync.socket.client.parse_message', {}, () =>
+				JSON.parse(ev.data.toString())
+			) as TLSocketServerSentEvent<TLRecord>
+			const parentContext = extractTraceContext(parsed?.trace)
+			withSyncSpan(
+				'tlsync.socket.client.receive',
+				{
+					attributes: {
+						'tldraw.msg.type': parsed.type,
+					},
+				},
+				() => {
+					this.messageListeners.forEach((cb) =>
+						withSyncSpan('tlsync.socket.client.dispatch_message', {}, () => cb(parsed))
+					)
+				},
+				parentContext
+			)
 		}
 
 		this._ws = ws
@@ -198,13 +248,29 @@ export class ClientWebSocketAdapter implements TLPersistentClientSocket<TLRecord
 	sendMessage(msg: TLSocketClientSentEvent<TLRecord>) {
 		assert(!this.isDisposed, 'Tried to send message on a disposed socket')
 
-		if (!this._ws) return
+		if (!this._ws) {
+			withSyncSpan(
+				'tlsync.socket.client.send_dropped',
+				{ attributes: { 'tldraw.outcome': 'no_socket' } },
+				() => {}
+			)
+			return
+		}
 		if (this.connectionStatus === 'online') {
-			const chunks = chunk(JSON.stringify(msg))
-			for (const part of chunks) {
-				this._ws.send(part)
-			}
+			withSyncSpan('tlsync.socket.client.send', {}, () => {
+				const message = attachTraceCarrier(msg)
+				const payload = JSON.stringify(message)
+				const chunks = chunk(payload)
+				for (const part of chunks) {
+					this._ws!.send(part)
+				}
+			})
 		} else {
+			withSyncSpan(
+				'tlsync.socket.client.send_dropped',
+				{ attributes: { 'tldraw.outcome': this.connectionStatus } },
+				() => {}
+			)
 			console.warn('Tried to send message while ' + this.connectionStatus)
 		}
 	}

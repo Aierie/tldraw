@@ -33,7 +33,6 @@ export class Logger {
 				this.outgoing = []
 				await this.logger?.debug(batch)
 				for (const message of batch) {
-					// eslint-disable-next-line @typescript-eslint/no-deprecated
 					this.sentry?.addBreadcrumb({ message })
 				}
 			}

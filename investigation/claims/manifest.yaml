@@ -1,0 +1,190 @@
+version: 1
+owner: investigation
+last_updated: 2026-02-27
+
+checkpoints:
+  - id: v3_15_x
+    ref: 1e9ed3513
+    findings: investigation/findings/sync-persistence-investigation-v3.15.x.md
+  - id: d039
+    ref: d039f3a1a
+    findings: investigation/findings/sync-persistence-investigation-d039f3a1a.md
+  - id: c967
+    ref: 967d3af52
+    findings: investigation/findings/sync-persistence-investigation-967d3af52.md
+  - id: d1c7
+    ref: d1c72b2b0
+    findings: investigation/findings/sync-persistence-investigation-d1c72b2b0.md
+  - id: d6ff
+    ref: d6ff76672
+    findings: investigation/findings/sync-persistence-investigation-d6ff76672.md
+  - id: c5221
+    ref: 5221da51b
+    findings: investigation/findings/sync-persistence-investigation-5221da51b.md
+  - id: c95b
+    ref: 95b18b7c3
+    findings: investigation/findings/sync-persistence-investigation-95b18b7c3.md
+  - id: c266d
+    ref: 266d21c41
+    findings: investigation/findings/sync-persistence-investigation-266d21c41.md
+
+claims:
+  # Baseline
+  - id: CLM-V315-001
+    checkpoint: v3_15_x
+    priority: high
+    type: behavior
+    statement: "Server source session receives push_result, peers receive rebroadcast patch."
+    static_evidence:
+      - "packages/sync-core/src/lib/TLSyncRoom.ts::handlePushRequest"
+      - "packages/sync-core/src/lib/TLSyncRoom.ts::broadcastPatch"
+    test_ids: [T-PROTO-001, T-PROTO-002]
+
+  - id: CLM-V315-002
+    checkpoint: v3_15_x
+    priority: high
+    type: persistence
+    statement: "Persistence is deferred/batched (not per mutation), with onDataChange -> scheduler -> durable write."
+    static_evidence:
+      - "apps/dotcom/sync-worker/src/TLDrawDurableObject.ts::triggerPersistSchedule"
+      - "apps/dotcom/sync-worker/src/TLDrawDurableObject.ts::persistToDatabase"
+      - "apps/dotcom/sync-worker/src/AlarmScheduler.ts"
+    test_ids: [T-PERSIST-001, T-PERSIST-002]
+
+  # d039
+  - id: CLM-D039-001
+    checkpoint: d039
+    priority: high
+    type: architecture
+    statement: "TLSyncRoom moved from inline document storage to pluggable TLSyncStorage transaction boundary."
+    static_evidence:
+      - "packages/sync-core/src/lib/TLSyncRoom.ts"
+      - "packages/sync-core/src/lib/TLSyncStorage.ts"
+    test_ids: [T-STATIC-001]
+
+  - id: CLM-D039-002
+    checkpoint: d039
+    priority: medium
+    type: migration
+    statement: "Store migration model includes scope='storage' and migrateStorage pipeline."
+    static_evidence:
+      - "packages/store/src/lib/migrate.ts"
+      - "packages/store/src/lib/StoreSchema.ts::migrateStorage"
+    test_ids: [T-MIG-001]
+
+  # 967
+  - id: CLM-967-001
+    checkpoint: c967
+    priority: high
+    type: architecture
+    statement: "SQLite sync storage backend introduced with Cloudflare and Node wrappers."
+    static_evidence:
+      - "packages/sync-core/src/lib/SqlLiteSyncStorage.ts"
+      - "packages/sync-core/src/lib/DurableObjectSqliteSyncWrapper.ts"
+      - "packages/sync-core/src/lib/NodeSqliteWrapper.ts"
+    test_ids: [T-STATIC-002]
+
+  - id: CLM-967-002
+    checkpoint: c967
+    priority: high
+    type: rollout
+    statement: "Dotcom file-room DO path can boot with sqlite_file_storage feature flag."
+    static_evidence:
+      - "apps/dotcom/sync-worker/src/TLFileDurableObject.ts::loadStorage"
+      - "apps/dotcom/sync-worker/src/utils/featureFlags.ts"
+    test_ids: [T-BOOT-001]
+
+  # d1
+  - id: CLM-D1-001
+    checkpoint: d1c7
+    priority: high
+    type: migration
+    statement: "SQLite documents.state migrated from TEXT to BLOB with explicit v1->v2 migration path."
+    static_evidence:
+      - "packages/sync-core/src/lib/SQLiteSyncStorage.ts::migrateSqliteSyncStorage"
+      - "packages/sync-core/src/test/SQLiteSyncStorage.test.ts::Migration from TEXT to BLOB"
+    test_ids: [T-MIG-002, T-MIG-003]
+
+  # d6
+  - id: CLM-D6-001
+    checkpoint: d6ff
+    priority: high
+    type: resilience
+    statement: "TLFileDurableObject falls back to base in-memory load for non-ROOM_NOT_FOUND SQLite boot failures."
+    static_evidence:
+      - "apps/dotcom/sync-worker/src/TLFileDurableObject.ts::loadStorage"
+      - "apps/dotcom/sync-worker/src/TLDrawDurableObject.ts::ROOM_NOT_FOUND"
+    test_ids: [T-BOOT-002, T-BOOT-003]
+
+  - id: CLM-D6-002
+    checkpoint: d6ff
+    priority: medium
+    type: consistency
+    statement: "R2-vs-SQLite reconciliation uses lastPersistedR2Clock > sqliteClock condition."
+    static_evidence:
+      - "apps/dotcom/sync-worker/src/TLFileDurableObject.ts::loadStorage"
+      - "apps/dotcom/sync-worker/src/TLDrawDurableObject.ts::persistToDatabase"
+    test_ids: [T-BOOT-004]
+
+  # 5221
+  - id: CLM-5221-001
+    checkpoint: c5221
+    priority: high
+    type: migration
+    statement: "Fix for duplicate migration application is implemented by staged updates in StoreSchema.migrateStorage."
+    static_evidence:
+      - "packages/store/src/lib/StoreSchema.ts::migrateStorage"
+      - "packages/sync-core/src/test/SQLiteSyncStorage.test.ts::Schema migrations via migrateStorage"
+    test_ids: [T-MIG-004, T-MIG-005]
+
+  - id: CLM-5221-002
+    checkpoint: c5221
+    priority: medium
+    type: scope
+    statement: "Commit primarily changes migration engine, shape migration, and tests (not protocol handlers)."
+    static_evidence:
+      - "git show --name-only 5221da51b"
+    test_ids: [T-STATIC-003]
+
+  # 95
+  - id: CLM-95-001
+    checkpoint: c95b
+    priority: high
+    type: cloudflare
+    statement: "Cloudflare template migration chain changed to v1 new_classes + v2 classes_with_sqlite."
+    static_evidence:
+      - "templates/sync-cloudflare/wrangler.toml"
+      - "git show 95b18b7c3 -- templates/sync-cloudflare/wrangler.toml"
+    test_ids: [T-CF-001]
+
+  - id: CLM-95-002
+    checkpoint: c95b
+    priority: medium
+    type: scope
+    statement: "95b18 changes only template wrangler.toml."
+    static_evidence:
+      - "git show --name-only 95b18b7c3"
+    test_ids: [T-STATIC-004]
+
+  # 266
+  - id: CLM-266-001
+    checkpoint: c266d
+    priority: high
+    type: cloudflare
+    statement: "classes_with_sqlite v2 was treated as ineffective; v3 migrates by deleting old class and creating new sqlite class."
+    static_evidence:
+      - "templates/sync-cloudflare/wrangler.toml"
+      - "git show 266d21c41 -- templates/sync-cloudflare/wrangler.toml"
+    test_ids: [T-CF-002]
+
+  - id: CLM-266-002
+    checkpoint: c266d
+    priority: high
+    type: cloudflare
+    statement: "Binding/export/types were aligned to TldrawDurableObjectSqlite."
+    static_evidence:
+      - "templates/sync-cloudflare/wrangler.toml"
+      - "templates/sync-cloudflare/worker/worker.ts"
+      - "templates/sync-cloudflare/worker-configuration.d.ts"
+      - "templates/sync-cloudflare/worker/TldrawDurableObjectSqlite.ts"
+    test_ids: [T-CF-003]

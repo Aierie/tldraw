@@ -43,12 +43,20 @@ import {
 } from './diff'
 import { interval } from './interval'
 import {
+	attachTraceCarrier,
+	extractTraceContext,
+	getSyncTraceAttributes,
+	setSafeAttributes,
+	withSyncSpan,
+} from './otel'
+import {
 	TLIncompatibilityReason,
 	TLSocketClientSentEvent,
 	TLSocketServerSentDataEvent,
 	TLSocketServerSentEvent,
 	getTlsyncProtocolVersion,
 } from './protocol'
+import { summarizeNetworkDiff, summarizeShapeHierarchyFromNetworkDiff } from './shapeTelemetry'
 
 /** @internal */
 export interface TLRoomSocket<R extends UnknownRecord> {
@@ -313,7 +321,6 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 			store: Object.fromEntries(
 				objectMapEntries(documents).map(([id, { state }]) => [id, state as R])
 			) as Record<IdOf<R>, R>,
-			// eslint-disable-next-line @typescript-eslint/no-deprecated
 			schema: snapshot.schema ?? this.schema.serializeEarliestVersion(),
 		})
 
@@ -431,57 +438,77 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 		sessionId: string,
 		message: TLSocketServerSentEvent<R> | TLSocketServerSentDataEvent<R>
 	) {
-		const session = this.sessions.get(sessionId)
-		if (!session) {
-			this.log?.warn?.('Tried to send message to unknown session', message.type)
-			return
-		}
-		if (session.state !== RoomSessionState.Connected) {
-			this.log?.warn?.('Tried to send message to disconnected client', message.type)
-			return
-		}
-		if (session.socket.isOpen) {
-			if (message.type !== 'patch' && message.type !== 'push_result') {
-				// this is not a data message
-				if (message.type !== 'pong') {
-					// non-data messages like "connect" might still need to be ordered correctly with
-					// respect to data messages, so it's better to flush just in case
-					this._flushDataMessages(sessionId)
+		withSyncSpan(
+			'tlsync.socket.server.send',
+			{
+				attributes: {
+					...getSyncTraceAttributes(),
+					'tldraw.room.session_id': sessionId,
+					'tldraw.msg.type': message.type,
+				},
+			},
+			() => {
+				const session = this.sessions.get(sessionId)
+				if (!session) {
+					this.log?.warn?.('Tried to send message to unknown session', message.type)
+					return
 				}
-				session.socket.sendMessage(message)
-			} else {
-				if (session.debounceTimer === null) {
-					// this is the first message since the last flush, don't delay it
-					session.socket.sendMessage({ type: 'data', data: [message] })
+				if (session.state !== RoomSessionState.Connected) {
+					this.log?.warn?.('Tried to send message to disconnected client', message.type)
+					return
+				}
+				if (session.socket.isOpen) {
+					if (message.type !== 'patch' && message.type !== 'push_result') {
+						// this is not a data message
+						if (message.type !== 'pong') {
+							// non-data messages like "connect" might still need to be ordered correctly with
+							// respect to data messages, so it's better to flush just in case
+							this._flushDataMessages(sessionId)
+						}
+						session.socket.sendMessage(attachTraceCarrier(message))
+					} else {
+						if (session.debounceTimer === null) {
+							// this is the first message since the last flush, don't delay it
+							session.socket.sendMessage(attachTraceCarrier({ type: 'data', data: [message] }))
 
-					session.debounceTimer = setTimeout(
-						() => this._flushDataMessages(sessionId),
-						DATA_MESSAGE_DEBOUNCE_INTERVAL
-					)
+							session.debounceTimer = setTimeout(
+								() => this._flushDataMessages(sessionId),
+								DATA_MESSAGE_DEBOUNCE_INTERVAL
+							)
+						} else {
+							session.outstandingDataMessages.push(message)
+						}
+					}
 				} else {
-					session.outstandingDataMessages.push(message)
+					this.cancelSession(session.sessionId)
 				}
 			}
-		} else {
-			this.cancelSession(session.sessionId)
-		}
+		)
 	}
 
 	// needs to accept sessionId and not a session because the session might be dead by the time
 	// the timer fires
 	_flushDataMessages(sessionId: string) {
-		const session = this.sessions.get(sessionId)
+		withSyncSpan(
+			'tlsync.socket.server.flush_data',
+			{ attributes: { ...getSyncTraceAttributes(), 'tldraw.room.session_id': sessionId } },
+			() => {
+				const session = this.sessions.get(sessionId)
 
-		if (!session || session.state !== RoomSessionState.Connected) {
-			return
-		}
+				if (!session || session.state !== RoomSessionState.Connected) {
+					return
+				}
 
-		session.debounceTimer = null
+				session.debounceTimer = null
 
-		if (session.outstandingDataMessages.length > 0) {
-			session.socket.sendMessage({ type: 'data', data: session.outstandingDataMessages })
-			session.outstandingDataMessages.length = 0
-		}
+				if (session.outstandingDataMessages.length > 0) {
+					session.socket.sendMessage(
+						attachTraceCarrier({ type: 'data', data: session.outstandingDataMessages })
+					)
+					session.outstandingDataMessages.length = 0
+				}
+			}
+		)
 	}
 
 	/** @internal */
@@ -561,33 +588,50 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 	 */
 	broadcastPatch(message: { diff: NetworkDiff<R>; sourceSessionId?: string }) {
 		const { diff, sourceSessionId } = message
-		this.sessions.forEach((session) => {
-			if (session.state !== RoomSessionState.Connected) return
-			if (sourceSessionId === session.sessionId) return
-			if (!session.socket.isOpen) {
-				this.cancelSession(session.sessionId)
-				return
+		withSyncSpan(
+			'tlsync.room.broadcast_patch',
+			{
+				attributes: {
+					...getSyncTraceAttributes(),
+					'tldraw.room.session_id': sourceSessionId,
+					'tlsync.listener_count': this.sessions.size,
+					...summarizeNetworkDiff(diff),
+					...summarizeShapeHierarchyFromNetworkDiff(diff),
+				},
+			},
+			(span) => {
+				let fanout = 0
+				this.sessions.forEach((session) => {
+					if (session.state !== RoomSessionState.Connected) return
+					if (sourceSessionId === session.sessionId) return
+					if (!session.socket.isOpen) {
+						this.cancelSession(session.sessionId)
+						return
+					}
+
+					const res = this.migrateDiffForSession(session.serializedSchema, diff)
+
+					if (!res.ok) {
+						// disconnect client and send incompatibility error
+						this.rejectSession(
+							session.sessionId,
+							res.error === MigrationFailureReason.TargetVersionTooNew
+								? TLSyncErrorCloseEventReason.SERVER_TOO_OLD
+								: TLSyncErrorCloseEventReason.CLIENT_TOO_OLD
+						)
+						return
+					}
+
+					fanout++
+					this.sendMessage(session.sessionId, {
+						type: 'patch',
+						diff: res.value,
+						serverClock: this.clock,
+					})
+				})
+				setSafeAttributes(span, { 'tldraw.room.fanout': fanout })
 			}
-
-			const res = this.migrateDiffForSession(session.serializedSchema, diff)
-
-			if (!res.ok) {
-				// disconnect client and send incompatibility error
-				this.rejectSession(
-					session.sessionId,
-					res.error === MigrationFailureReason.TargetVersionTooNew
-						? TLSyncErrorCloseEventReason.SERVER_TOO_OLD
-						: TLSyncErrorCloseEventReason.CLIENT_TOO_OLD
-				)
-				return
-			}
-
-			this.sendMessage(session.sessionId, {
-				type: 'patch',
-				diff: res.value,
-				serverClock: this.clock,
-			})
-		})
+		)
 		return this
 	}
 
@@ -674,512 +718,606 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 			this.log?.warn?.('Received message from unknown session')
 			return
 		}
-		switch (message.type) {
-			case 'connect': {
-				return this.handleConnectRequest(session, message)
-			}
-			case 'push': {
-				return this.handlePushRequest(session, message)
-			}
-			case 'ping': {
-				if (session.state === RoomSessionState.Connected) {
-					session.lastInteractionTime = Date.now()
+		const traceContext = extractTraceContext(message.trace)
+		return withSyncSpan(
+			'tlsync.room.handle_message',
+			{
+				attributes: {
+					...getSyncTraceAttributes(traceContext),
+					'tldraw.room.session_id': sessionId,
+					'tldraw.msg.type': message.type,
+				},
+			},
+			() => {
+				switch (message.type) {
+					case 'connect': {
+						return this.handleConnectRequest(session, message)
+					}
+					case 'push': {
+						return this.handlePushRequest(session, message)
+					}
+					case 'ping': {
+						if (session.state === RoomSessionState.Connected) {
+							session.lastInteractionTime = Date.now()
+						}
+						return this.sendMessage(session.sessionId, { type: 'pong' })
+					}
+					default: {
+						exhaustiveSwitchError(message)
+					}
 				}
-				return this.sendMessage(session.sessionId, { type: 'pong' })
-			}
-			default: {
-				exhaustiveSwitchError(message)
-			}
-		}
+			},
+			traceContext
+		)
 	}
 
 	/** If the client is out of date, or we are out of date, we need to let them know */
 	rejectSession(sessionId: string, fatalReason?: TLSyncErrorCloseEventReason | string) {
-		const session = this.sessions.get(sessionId)
-		if (!session) return
-		if (!fatalReason) {
-			this.removeSession(sessionId)
-			return
-		}
-		if (session.requiresLegacyRejection) {
-			try {
-				if (session.socket.isOpen) {
-					// eslint-disable-next-line @typescript-eslint/no-deprecated
-					let legacyReason: TLIncompatibilityReason
-					switch (fatalReason) {
-						case TLSyncErrorCloseEventReason.CLIENT_TOO_OLD:
-							// eslint-disable-next-line @typescript-eslint/no-deprecated
-							legacyReason = TLIncompatibilityReason.ClientTooOld
-							break
-						case TLSyncErrorCloseEventReason.SERVER_TOO_OLD:
-							// eslint-disable-next-line @typescript-eslint/no-deprecated
-							legacyReason = TLIncompatibilityReason.ServerTooOld
-							break
-						case TLSyncErrorCloseEventReason.INVALID_RECORD:
-							// eslint-disable-next-line @typescript-eslint/no-deprecated
-							legacyReason = TLIncompatibilityReason.InvalidRecord
-							break
-						default:
-							// eslint-disable-next-line @typescript-eslint/no-deprecated
-							legacyReason = TLIncompatibilityReason.InvalidOperation
-							break
-					}
-					session.socket.sendMessage({
-						type: 'incompatibility_error',
-						reason: legacyReason,
-					})
+		withSyncSpan(
+			'tlsync.room.reject_session',
+			{
+				attributes: {
+					'tldraw.room.session_id': sessionId,
+					'tldraw.outcome': fatalReason ?? 'disconnect',
+				},
+			},
+			() => {
+				const session = this.sessions.get(sessionId)
+				if (!session) return
+				if (!fatalReason) {
+					this.removeSession(sessionId)
+					return
 				}
-			} catch {
-				// noop
-			} finally {
-				this.removeSession(sessionId)
+				if (session.requiresLegacyRejection) {
+					try {
+						if (session.socket.isOpen) {
+							// eslint-disable-next-line @typescript-eslint/no-deprecated
+							let legacyReason: TLIncompatibilityReason
+							switch (fatalReason) {
+								case TLSyncErrorCloseEventReason.CLIENT_TOO_OLD:
+									// eslint-disable-next-line @typescript-eslint/no-deprecated
+									legacyReason = TLIncompatibilityReason.ClientTooOld
+									break
+								case TLSyncErrorCloseEventReason.SERVER_TOO_OLD:
+									// eslint-disable-next-line @typescript-eslint/no-deprecated
+									legacyReason = TLIncompatibilityReason.ServerTooOld
+									break
+								case TLSyncErrorCloseEventReason.INVALID_RECORD:
+									// eslint-disable-next-line @typescript-eslint/no-deprecated
+									legacyReason = TLIncompatibilityReason.InvalidRecord
+									break
+								default:
+									// eslint-disable-next-line @typescript-eslint/no-deprecated
+									legacyReason = TLIncompatibilityReason.InvalidOperation
+									break
+							}
+							session.socket.sendMessage(
+								attachTraceCarrier({
+									type: 'incompatibility_error',
+									reason: legacyReason,
+								})
+							)
+						}
+					} catch {
+						// noop
+					} finally {
+						this.removeSession(sessionId)
+					}
+				} else {
+					this.removeSession(sessionId, fatalReason)
+				}
 			}
-		} else {
-			this.removeSession(sessionId, fatalReason)
-		}
+		)
 	}
 
 	private handleConnectRequest(
 		session: RoomSession<R, SessionMeta>,
 		message: Extract<TLSocketClientSentEvent<R>, { type: 'connect' }>
 	) {
-		// if the protocol versions don't match, disconnect the client
-		// we will eventually want to try to make our protocol backwards compatible to some degree
-		// and have a MIN_PROTOCOL_VERSION constant that the TLSyncRoom implements support for
-		let theirProtocolVersion = message.protocolVersion
-		// 5 is the same as 6
-		if (theirProtocolVersion === 5) {
-			theirProtocolVersion = 6
-		}
-		// 6 is almost the same as 7
-		session.requiresLegacyRejection = theirProtocolVersion === 6
-		if (theirProtocolVersion === 6) {
-			theirProtocolVersion++
-		}
-		if (theirProtocolVersion == null || theirProtocolVersion < getTlsyncProtocolVersion()) {
-			this.rejectSession(session.sessionId, TLSyncErrorCloseEventReason.CLIENT_TOO_OLD)
-			return
-		} else if (theirProtocolVersion > getTlsyncProtocolVersion()) {
-			this.rejectSession(session.sessionId, TLSyncErrorCloseEventReason.SERVER_TOO_OLD)
-			return
-		}
-		// If the client's store is at a different version to ours, it could cause corruption.
-		// We should disconnect the client and ask them to refresh.
-		if (message.schema == null) {
-			this.rejectSession(session.sessionId, TLSyncErrorCloseEventReason.CLIENT_TOO_OLD)
-			return
-		}
-		const migrations = this.schema.getMigrationsSince(message.schema)
-		// if the client's store is at a different version to ours, we can't support them
-		if (!migrations.ok || migrations.value.some((m) => m.scope === 'store' || !m.down)) {
-			this.rejectSession(session.sessionId, TLSyncErrorCloseEventReason.CLIENT_TOO_OLD)
-			return
-		}
-
-		const sessionSchema = isEqual(message.schema, this.serializedSchema)
-			? this.serializedSchema
-			: message.schema
-
-		const connect = (msg: TLSocketServerSentEvent<R>) => {
-			this.sessions.set(session.sessionId, {
-				state: RoomSessionState.Connected,
-				sessionId: session.sessionId,
-				presenceId: session.presenceId,
-				socket: session.socket,
-				serializedSchema: sessionSchema,
-				lastInteractionTime: Date.now(),
-				debounceTimer: null,
-				outstandingDataMessages: [],
-				meta: session.meta,
-				isReadonly: session.isReadonly,
-				requiresLegacyRejection: session.requiresLegacyRejection,
-			})
-			this.sendMessage(session.sessionId, msg)
-		}
-
-		transaction((rollback) => {
-			if (
-				// if the client requests changes since a time before we have tombstone history, send them the full state
-				message.lastServerClock < this.tombstoneHistoryStartsAtClock ||
-				// similarly, if they ask for a time we haven't reached yet, send them the full state
-				// this will only happen if the DB is reset (or there is no db) and the server restarts
-				// or if the server exits/crashes with unpersisted changes
-				message.lastServerClock > this.clock
-			) {
-				const diff: NetworkDiff<R> = {}
-				for (const [id, doc] of Object.entries(this.state.get().documents)) {
-					if (id !== session.presenceId) {
-						diff[id] = [RecordOpType.Put, doc.state]
-					}
+		return withSyncSpan(
+			'tlsync.room.connect',
+			{
+				attributes: {
+					'tldraw.room.session_id': session.sessionId,
+					'tldraw.msg.type': message.type,
+				},
+			},
+			() => {
+				// if the protocol versions don't match, disconnect the client
+				// we will eventually want to try to make our protocol backwards compatible to some degree
+				// and have a MIN_PROTOCOL_VERSION constant that the TLSyncRoom implements support for
+				let theirProtocolVersion = message.protocolVersion
+				// 5 is the same as 6
+				if (theirProtocolVersion === 5) {
+					theirProtocolVersion = 6
 				}
-				const migrated = this.migrateDiffForSession(sessionSchema, diff)
-				if (!migrated.ok) {
-					rollback()
-					this.rejectSession(
-						session.sessionId,
-						migrated.error === MigrationFailureReason.TargetVersionTooNew
-							? TLSyncErrorCloseEventReason.SERVER_TOO_OLD
-							: TLSyncErrorCloseEventReason.CLIENT_TOO_OLD
-					)
+				// 6 is almost the same as 7
+				session.requiresLegacyRejection = theirProtocolVersion === 6
+				if (theirProtocolVersion === 6) {
+					theirProtocolVersion++
+				}
+				if (theirProtocolVersion == null || theirProtocolVersion < getTlsyncProtocolVersion()) {
+					this.rejectSession(session.sessionId, TLSyncErrorCloseEventReason.CLIENT_TOO_OLD)
+					return
+				} else if (theirProtocolVersion > getTlsyncProtocolVersion()) {
+					this.rejectSession(session.sessionId, TLSyncErrorCloseEventReason.SERVER_TOO_OLD)
 					return
 				}
-				connect({
-					type: 'connect',
-					connectRequestId: message.connectRequestId,
-					hydrationType: 'wipe_all',
-					protocolVersion: getTlsyncProtocolVersion(),
-					schema: this.schema.serialize(),
-					serverClock: this.clock,
-					diff: migrated.value,
-					isReadonly: session.isReadonly,
-				})
-			} else {
-				// calculate the changes since the time the client last saw
-				const diff: NetworkDiff<R> = {}
-				const updatedDocs = Object.values(this.state.get().documents).filter(
-					(doc) => doc.lastChangedClock > message.lastServerClock
-				)
-				const presenceDocs = this.presenceType
-					? Object.values(this.state.get().documents).filter(
-							(doc) =>
-								this.presenceType!.typeName === doc.state.typeName &&
-								doc.state.id !== session.presenceId
+				// If the client's store is at a different version to ours, it could cause corruption.
+				// We should disconnect the client and ask them to refresh.
+				if (message.schema == null) {
+					this.rejectSession(session.sessionId, TLSyncErrorCloseEventReason.CLIENT_TOO_OLD)
+					return
+				}
+				const migrations = this.schema.getMigrationsSince(message.schema)
+				// if the client's store is at a different version to ours, we can't support them
+				if (!migrations.ok || migrations.value.some((m) => m.scope === 'store' || !m.down)) {
+					this.rejectSession(session.sessionId, TLSyncErrorCloseEventReason.CLIENT_TOO_OLD)
+					return
+				}
+
+				const sessionSchema = isEqual(message.schema, this.serializedSchema)
+					? this.serializedSchema
+					: message.schema
+
+				const connect = (msg: TLSocketServerSentEvent<R>) => {
+					this.sessions.set(session.sessionId, {
+						state: RoomSessionState.Connected,
+						sessionId: session.sessionId,
+						presenceId: session.presenceId,
+						socket: session.socket,
+						serializedSchema: sessionSchema,
+						lastInteractionTime: Date.now(),
+						debounceTimer: null,
+						outstandingDataMessages: [],
+						meta: session.meta,
+						isReadonly: session.isReadonly,
+						requiresLegacyRejection: session.requiresLegacyRejection,
+					})
+					this.sendMessage(session.sessionId, msg)
+				}
+
+				transaction((rollback) => {
+					if (
+						// if the client requests changes since a time before we have tombstone history, send them the full state
+						message.lastServerClock < this.tombstoneHistoryStartsAtClock ||
+						// similarly, if they ask for a time we haven't reached yet, send them the full state
+						// this will only happen if the DB is reset (or there is no db) and the server restarts
+						// or if the server exits/crashes with unpersisted changes
+						message.lastServerClock > this.clock
+					) {
+						const diff: NetworkDiff<R> = {}
+						for (const [id, doc] of Object.entries(this.state.get().documents)) {
+							if (id !== session.presenceId) {
+								diff[id] = [RecordOpType.Put, doc.state]
+							}
+						}
+						const migrated = this.migrateDiffForSession(sessionSchema, diff)
+						if (!migrated.ok) {
+							rollback()
+							this.rejectSession(
+								session.sessionId,
+								migrated.error === MigrationFailureReason.TargetVersionTooNew
+									? TLSyncErrorCloseEventReason.SERVER_TOO_OLD
+									: TLSyncErrorCloseEventReason.CLIENT_TOO_OLD
+							)
+							return
+						}
+						connect({
+							type: 'connect',
+							connectRequestId: message.connectRequestId,
+							hydrationType: 'wipe_all',
+							protocolVersion: getTlsyncProtocolVersion(),
+							schema: this.schema.serialize(),
+							serverClock: this.clock,
+							diff: migrated.value,
+							isReadonly: session.isReadonly,
+						})
+					} else {
+						// calculate the changes since the time the client last saw
+						const diff: NetworkDiff<R> = {}
+						const updatedDocs = Object.values(this.state.get().documents).filter(
+							(doc) => doc.lastChangedClock > message.lastServerClock
 						)
-					: []
-				const deletedDocsIds = Object.entries(this.state.get().tombstones)
-					.filter(([_id, deletedAtClock]) => deletedAtClock > message.lastServerClock)
-					.map(([id]) => id)
+						const presenceDocs = this.presenceType
+							? Object.values(this.state.get().documents).filter(
+									(doc) =>
+										this.presenceType!.typeName === doc.state.typeName &&
+										doc.state.id !== session.presenceId
+								)
+							: []
+						const deletedDocsIds = Object.entries(this.state.get().tombstones)
+							.filter(([_id, deletedAtClock]) => deletedAtClock > message.lastServerClock)
+							.map(([id]) => id)
 
-				for (const doc of updatedDocs) {
-					diff[doc.state.id] = [RecordOpType.Put, doc.state]
-				}
-				for (const doc of presenceDocs) {
-					diff[doc.state.id] = [RecordOpType.Put, doc.state]
-				}
+						for (const doc of updatedDocs) {
+							diff[doc.state.id] = [RecordOpType.Put, doc.state]
+						}
+						for (const doc of presenceDocs) {
+							diff[doc.state.id] = [RecordOpType.Put, doc.state]
+						}
 
-				for (const docId of deletedDocsIds) {
-					diff[docId] = [RecordOpType.Remove]
-				}
-				const migrated = this.migrateDiffForSession(sessionSchema, diff)
-				if (!migrated.ok) {
-					rollback()
-					this.rejectSession(
-						session.sessionId,
-						migrated.error === MigrationFailureReason.TargetVersionTooNew
-							? TLSyncErrorCloseEventReason.SERVER_TOO_OLD
-							: TLSyncErrorCloseEventReason.CLIENT_TOO_OLD
-					)
-					return
-				}
+						for (const docId of deletedDocsIds) {
+							diff[docId] = [RecordOpType.Remove]
+						}
+						const migrated = this.migrateDiffForSession(sessionSchema, diff)
+						if (!migrated.ok) {
+							rollback()
+							this.rejectSession(
+								session.sessionId,
+								migrated.error === MigrationFailureReason.TargetVersionTooNew
+									? TLSyncErrorCloseEventReason.SERVER_TOO_OLD
+									: TLSyncErrorCloseEventReason.CLIENT_TOO_OLD
+							)
+							return
+						}
 
-				connect({
-					type: 'connect',
-					connectRequestId: message.connectRequestId,
-					hydrationType: 'wipe_presence',
-					schema: this.schema.serialize(),
-					protocolVersion: getTlsyncProtocolVersion(),
-					serverClock: this.clock,
-					diff: migrated.value,
-					isReadonly: session.isReadonly,
+						connect({
+							type: 'connect',
+							connectRequestId: message.connectRequestId,
+							hydrationType: 'wipe_presence',
+							schema: this.schema.serialize(),
+							protocolVersion: getTlsyncProtocolVersion(),
+							serverClock: this.clock,
+							diff: migrated.value,
+							isReadonly: session.isReadonly,
+						})
+					}
 				})
 			}
-		})
+		)
 	}
 
 	private handlePushRequest(
 		session: RoomSession<R, SessionMeta> | null,
 		message: Extract<TLSocketClientSentEvent<R>, { type: 'push' }>
 	) {
-		// We must be connected to handle push requests
-		if (session && session.state !== RoomSessionState.Connected) {
-			return
-		}
+		return withSyncSpan(
+			'tlsync.room.push',
+			{
+				attributes: {
+					...getSyncTraceAttributes(),
+					'tldraw.room.session_id': session?.sessionId,
+					'tldraw.msg.type': message.type,
+					'tldraw.client.clock': message.clientClock,
+					...summarizeNetworkDiff(message.diff),
+					...summarizeShapeHierarchyFromNetworkDiff(message.diff),
+				},
+			},
+			(span) => {
+				// We must be connected to handle push requests
+				if (session && session.state !== RoomSessionState.Connected) {
+					span.setAttribute('tldraw.outcome', 'dropped')
+					return
+				}
 
-		// update the last interaction time
-		if (session) {
-			session.lastInteractionTime = Date.now()
-		}
-
-		// increment the clock for this push
-		this.clock++
-
-		const initialDocumentClock = this.documentClock
-		let didPresenceChange = false
-		transaction((rollback) => {
-			// collect actual ops that resulted from the push
-			// these will be broadcast to other users
-			interface ActualChanges {
-				diff: NetworkDiff<R> | null
-			}
-			const docChanges: ActualChanges = { diff: null }
-			const presenceChanges: ActualChanges = { diff: null }
-
-			const propagateOp = (changes: ActualChanges, id: string, op: RecordOp<R>) => {
-				if (!changes.diff) changes.diff = {}
-				changes.diff[id] = op
-			}
-
-			const fail = (
-				reason: TLSyncErrorCloseEventReason,
-				underlyingError?: Error
-			): Result<void, void> => {
-				rollback()
+				// update the last interaction time
 				if (session) {
-					this.rejectSession(session.sessionId, reason)
-				} else {
-					throw new Error('failed to apply changes: ' + reason, underlyingError)
-				}
-				if (typeof process !== 'undefined' && process.env.NODE_ENV !== 'test') {
-					this.log?.error?.('failed to apply push', reason, message, underlyingError)
-				}
-				return Result.err(undefined)
-			}
-
-			const addDocument = (changes: ActualChanges, id: string, _state: R): Result<void, void> => {
-				const res = session
-					? this.schema.migratePersistedRecord(_state, session.serializedSchema, 'up')
-					: { type: 'success' as const, value: _state }
-				if (res.type === 'error') {
-					return fail(
-						res.reason === MigrationFailureReason.TargetVersionTooOld // target version is our version
-							? TLSyncErrorCloseEventReason.SERVER_TOO_OLD
-							: TLSyncErrorCloseEventReason.CLIENT_TOO_OLD
-					)
-				}
-				const { value: state } = res
-
-				// Get the existing document, if any
-				const doc = this.getDocument(id)
-
-				if (doc) {
-					// If there's an existing document, replace it with the new state
-					// but propagate a diff rather than the entire value
-					const diff = doc.replaceState(state, this.clock)
-					if (!diff.ok) {
-						return fail(TLSyncErrorCloseEventReason.INVALID_RECORD)
-					}
-					if (diff.value) {
-						propagateOp(changes, id, [RecordOpType.Patch, diff.value])
-					}
-				} else {
-					// Otherwise, if we don't already have a document with this id
-					// create the document and propagate the put op
-					const result = this.addDocument(id, state, this.clock)
-					if (!result.ok) {
-						return fail(TLSyncErrorCloseEventReason.INVALID_RECORD)
-					}
-					propagateOp(changes, id, [RecordOpType.Put, state])
+					session.lastInteractionTime = Date.now()
 				}
 
-				return Result.ok(undefined)
-			}
+				// increment the clock for this push
+				this.clock++
 
-			const patchDocument = (
-				changes: ActualChanges,
-				id: string,
-				patch: ObjectDiff
-			): Result<void, void> => {
-				// if it was already deleted, there's no need to apply the patch
-				const doc = this.getDocument(id)
-				if (!doc) return Result.ok(undefined)
-				// If the client's version of the record is older than ours,
-				// we apply the patch to the downgraded version of the record
-				const downgraded = session
-					? this.schema.migratePersistedRecord(doc.state, session.serializedSchema, 'down')
-					: { type: 'success' as const, value: doc.state }
-				if (downgraded.type === 'error') {
-					return fail(TLSyncErrorCloseEventReason.CLIENT_TOO_OLD)
-				}
+				const initialDocumentClock = this.documentClock
+				let didPresenceChange = false
+				let pushOutcomeAction: 'commit' | 'discard' | 'rebase' | 'none' = 'none'
+				let didBroadcast = false
+				transaction((rollback) => {
+					// collect actual ops that resulted from the push
+					// these will be broadcast to other users
+					interface ActualChanges {
+						diff: NetworkDiff<R> | null
+					}
+					const docChanges: ActualChanges = { diff: null }
+					const presenceChanges: ActualChanges = { diff: null }
 
-				if (downgraded.value === doc.state) {
-					// If the versions are compatible, apply the patch and propagate the patch op
-					const diff = doc.mergeDiff(patch, this.clock)
-					if (!diff.ok) {
-						return fail(TLSyncErrorCloseEventReason.INVALID_RECORD)
+					const propagateOp = (changes: ActualChanges, id: string, op: RecordOp<R>) => {
+						if (!changes.diff) changes.diff = {}
+						changes.diff[id] = op
 					}
-					if (diff.value) {
-						propagateOp(changes, id, [RecordOpType.Patch, diff.value])
-					}
-				} else {
-					// need to apply the patch to the downgraded version and then upgrade it
 
-					// apply the patch to the downgraded version
-					const patched = applyObjectDiff(downgraded.value, patch)
-					// then upgrade the patched version and use that as the new state
-					const upgraded = session
-						? this.schema.migratePersistedRecord(patched, session.serializedSchema, 'up')
-						: { type: 'success' as const, value: patched }
-					// If the client's version is too old, we'll hit an error
-					if (upgraded.type === 'error') {
-						return fail(TLSyncErrorCloseEventReason.CLIENT_TOO_OLD)
+					const fail = (
+						reason: TLSyncErrorCloseEventReason,
+						underlyingError?: Error
+					): Result<void, void> => {
+						rollback()
+						if (session) {
+							this.rejectSession(session.sessionId, reason)
+						} else {
+							throw new Error('failed to apply changes: ' + reason, underlyingError)
+						}
+						if (typeof process !== 'undefined' && process.env.NODE_ENV !== 'test') {
+							this.log?.error?.('failed to apply push', reason, message, underlyingError)
+						}
+						return Result.err(undefined)
 					}
-					// replace the state with the upgraded version and propagate the patch op
-					const diff = doc.replaceState(upgraded.value, this.clock)
-					if (!diff.ok) {
-						return fail(TLSyncErrorCloseEventReason.INVALID_RECORD)
-					}
-					if (diff.value) {
-						propagateOp(changes, id, [RecordOpType.Patch, diff.value])
-					}
-				}
 
-				return Result.ok(undefined)
-			}
+					const addDocument = (
+						changes: ActualChanges,
+						id: string,
+						_state: R
+					): Result<void, void> => {
+						const res = session
+							? this.schema.migratePersistedRecord(_state, session.serializedSchema, 'up')
+							: { type: 'success' as const, value: _state }
+						if (res.type === 'error') {
+							return fail(
+								res.reason === MigrationFailureReason.TargetVersionTooOld // target version is our version
+									? TLSyncErrorCloseEventReason.SERVER_TOO_OLD
+									: TLSyncErrorCloseEventReason.CLIENT_TOO_OLD
+							)
+						}
+						const { value: state } = res
 
-			const { clientClock } = message
+						// Get the existing document, if any
+						const doc = this.getDocument(id)
 
-			if (this.presenceType && session?.presenceId && 'presence' in message && message.presence) {
-				if (!session) throw new Error('session is required for presence pushes')
-				// The push request was for the presence scope.
-				const id = session.presenceId
-				const [type, val] = message.presence
-				const { typeName } = this.presenceType
-				switch (type) {
-					case RecordOpType.Put: {
-						// Try to put the document. If it fails, stop here.
-						const res = addDocument(presenceChanges, id, { ...val, id, typeName })
-						// if res.ok is false here then we already called `fail` and we should stop immediately
-						if (!res.ok) return
-						break
-					}
-					case RecordOpType.Patch: {
-						// Try to patch the document. If it fails, stop here.
-						const res = patchDocument(presenceChanges, id, {
-							...val,
-							id: [ValueOpType.Put, id],
-							typeName: [ValueOpType.Put, typeName],
-						})
-						// if res.ok is false here then we already called `fail` and we should stop immediately
-						if (!res.ok) return
-						break
-					}
-				}
-			}
-			if (message.diff && !session?.isReadonly) {
-				// The push request was for the document scope.
-				for (const [id, op] of Object.entries(message.diff!)) {
-					switch (op[0]) {
-						case RecordOpType.Put: {
-							// Try to add the document.
-							// If we're putting a record with a type that we don't recognize, fail
-							if (!this.documentTypes.has(op[1].typeName)) {
+						if (doc) {
+							// If there's an existing document, replace it with the new state
+							// but propagate a diff rather than the entire value
+							const diff = doc.replaceState(state, this.clock)
+							if (!diff.ok) {
 								return fail(TLSyncErrorCloseEventReason.INVALID_RECORD)
 							}
-							const res = addDocument(docChanges, id, op[1])
-							// if res.ok is false here then we already called `fail` and we should stop immediately
-							if (!res.ok) return
-							break
-						}
-						case RecordOpType.Patch: {
-							// Try to patch the document. If it fails, stop here.
-							const res = patchDocument(docChanges, id, op[1])
-							// if res.ok is false here then we already called `fail` and we should stop immediately
-							if (!res.ok) return
-							break
-						}
-						case RecordOpType.Remove: {
-							const doc = this.getDocument(id)
-							if (!doc) {
-								// If the doc was already deleted, don't do anything, no need to propagate a delete op
-								continue
+							if (diff.value) {
+								propagateOp(changes, id, [RecordOpType.Patch, diff.value])
 							}
+						} else {
+							// Otherwise, if we don't already have a document with this id
+							// create the document and propagate the put op
+							const result = this.addDocument(id, state, this.clock)
+							if (!result.ok) {
+								return fail(TLSyncErrorCloseEventReason.INVALID_RECORD)
+							}
+							propagateOp(changes, id, [RecordOpType.Put, state])
+						}
 
-							// Delete the document and propagate the delete op
-							this.removeDocument(id, this.clock)
-							// Schedule a pruneTombstones call to happen on the next call stack
-							setTimeout(this.pruneTombstones, 0)
-							propagateOp(docChanges, id, op)
-							break
+						return Result.ok(undefined)
+					}
+
+					const patchDocument = (
+						changes: ActualChanges,
+						id: string,
+						patch: ObjectDiff
+					): Result<void, void> => {
+						// if it was already deleted, there's no need to apply the patch
+						const doc = this.getDocument(id)
+						if (!doc) return Result.ok(undefined)
+						// If the client's version of the record is older than ours,
+						// we apply the patch to the downgraded version of the record
+						const downgraded = session
+							? this.schema.migratePersistedRecord(doc.state, session.serializedSchema, 'down')
+							: { type: 'success' as const, value: doc.state }
+						if (downgraded.type === 'error') {
+							return fail(TLSyncErrorCloseEventReason.CLIENT_TOO_OLD)
+						}
+
+						if (downgraded.value === doc.state) {
+							// If the versions are compatible, apply the patch and propagate the patch op
+							const diff = doc.mergeDiff(patch, this.clock)
+							if (!diff.ok) {
+								return fail(TLSyncErrorCloseEventReason.INVALID_RECORD)
+							}
+							if (diff.value) {
+								propagateOp(changes, id, [RecordOpType.Patch, diff.value])
+							}
+						} else {
+							// need to apply the patch to the downgraded version and then upgrade it
+
+							// apply the patch to the downgraded version
+							const patched = applyObjectDiff(downgraded.value, patch)
+							// then upgrade the patched version and use that as the new state
+							const upgraded = session
+								? this.schema.migratePersistedRecord(patched, session.serializedSchema, 'up')
+								: { type: 'success' as const, value: patched }
+							// If the client's version is too old, we'll hit an error
+							if (upgraded.type === 'error') {
+								return fail(TLSyncErrorCloseEventReason.CLIENT_TOO_OLD)
+							}
+							// replace the state with the upgraded version and propagate the patch op
+							const diff = doc.replaceState(upgraded.value, this.clock)
+							if (!diff.ok) {
+								return fail(TLSyncErrorCloseEventReason.INVALID_RECORD)
+							}
+							if (diff.value) {
+								propagateOp(changes, id, [RecordOpType.Patch, diff.value])
+							}
+						}
+
+						return Result.ok(undefined)
+					}
+
+					const { clientClock } = message
+
+					if (
+						this.presenceType &&
+						session?.presenceId &&
+						'presence' in message &&
+						message.presence
+					) {
+						if (!session) throw new Error('session is required for presence pushes')
+						// The push request was for the presence scope.
+						const id = session.presenceId
+						const [type, val] = message.presence
+						const { typeName } = this.presenceType
+						switch (type) {
+							case RecordOpType.Put: {
+								// Try to put the document. If it fails, stop here.
+								const res = addDocument(presenceChanges, id, { ...val, id, typeName })
+								// if res.ok is false here then we already called `fail` and we should stop immediately
+								if (!res.ok) return
+								break
+							}
+							case RecordOpType.Patch: {
+								// Try to patch the document. If it fails, stop here.
+								const res = patchDocument(presenceChanges, id, {
+									...val,
+									id: [ValueOpType.Put, id],
+									typeName: [ValueOpType.Put, typeName],
+								})
+								// if res.ok is false here then we already called `fail` and we should stop immediately
+								if (!res.ok) return
+								break
+							}
 						}
 					}
-				}
-			}
+					if (message.diff && !session?.isReadonly) {
+						// The push request was for the document scope.
+						for (const [id, op] of Object.entries(message.diff!)) {
+							switch (op[0]) {
+								case RecordOpType.Put: {
+									// Try to add the document.
+									// If we're putting a record with a type that we don't recognize, fail
+									if (!this.documentTypes.has(op[1].typeName)) {
+										return fail(TLSyncErrorCloseEventReason.INVALID_RECORD)
+									}
+									const res = addDocument(docChanges, id, op[1])
+									// if res.ok is false here then we already called `fail` and we should stop immediately
+									if (!res.ok) return
+									break
+								}
+								case RecordOpType.Patch: {
+									// Try to patch the document. If it fails, stop here.
+									const res = patchDocument(docChanges, id, op[1])
+									// if res.ok is false here then we already called `fail` and we should stop immediately
+									if (!res.ok) return
+									break
+								}
+								case RecordOpType.Remove: {
+									const doc = this.getDocument(id)
+									if (!doc) {
+										// If the doc was already deleted, don't do anything, no need to propagate a delete op
+										continue
+									}
 
-			// Let the client know what action to take based on the results of the push
-			if (
-				// if there was only a presence push, the client doesn't need to do anything aside from
-				// shift the push request.
-				!message.diff ||
-				isEqual(docChanges.diff, message.diff)
-			) {
-				// COMMIT
-				// Applying the client's changes had the exact same effect on the server as
-				// they had on the client, so the client should keep the diff
-				if (session) {
-					this.sendMessage(session.sessionId, {
-						type: 'push_result',
-						serverClock: this.clock,
-						clientClock,
-						action: 'commit',
-					})
-				}
-			} else if (!docChanges.diff) {
-				// DISCARD
-				// Applying the client's changes had no effect, so the client should drop the diff
-				if (session) {
-					this.sendMessage(session.sessionId, {
-						type: 'push_result',
-						serverClock: this.clock,
-						clientClock,
-						action: 'discard',
-					})
-				}
-			} else {
-				// REBASE
-				// Applying the client's changes had a different non-empty effect on the server,
-				// so the client should rebase with our gold-standard / authoritative diff.
-				// First we need to migrate the diff to the client's version
-				if (session) {
-					const migrateResult = this.migrateDiffForSession(
-						session.serializedSchema,
-						docChanges.diff
-					)
-					if (!migrateResult.ok) {
-						return fail(
-							migrateResult.error === MigrationFailureReason.TargetVersionTooNew
-								? TLSyncErrorCloseEventReason.SERVER_TOO_OLD
-								: TLSyncErrorCloseEventReason.CLIENT_TOO_OLD
-						)
+									// Delete the document and propagate the delete op
+									this.removeDocument(id, this.clock)
+									// Schedule a pruneTombstones call to happen on the next call stack
+									setTimeout(this.pruneTombstones, 0)
+									propagateOp(docChanges, id, op)
+									break
+								}
+							}
+						}
 					}
-					// If the migration worked, send the rebased diff to the client
-					this.sendMessage(session.sessionId, {
-						type: 'push_result',
-						serverClock: this.clock,
-						clientClock,
-						action: { rebaseWithDiff: migrateResult.value },
-					})
-				}
-			}
 
-			// If there are merged changes, broadcast them to all other clients
-			if (docChanges.diff || presenceChanges.diff) {
-				this.broadcastPatch({
-					sourceSessionId: session?.sessionId,
-					diff: {
-						...docChanges.diff,
-						...presenceChanges.diff,
-					},
+					// Let the client know what action to take based on the results of the push
+					if (
+						// if there was only a presence push, the client doesn't need to do anything aside from
+						// shift the push request.
+						!message.diff ||
+						isEqual(docChanges.diff, message.diff)
+					) {
+						pushOutcomeAction = 'commit'
+						span.setAttribute('tldraw.outcome', 'committed')
+						// COMMIT
+						// Applying the client's changes had the exact same effect on the server as
+						// they had on the client, so the client should keep the diff
+						if (session) {
+							this.sendMessage(session.sessionId, {
+								type: 'push_result',
+								serverClock: this.clock,
+								clientClock,
+								action: 'commit',
+							})
+						}
+					} else if (!docChanges.diff) {
+						pushOutcomeAction = 'discard'
+						span.setAttribute('tldraw.outcome', 'discarded')
+						// DISCARD
+						// Applying the client's changes had no effect, so the client should drop the diff
+						if (session) {
+							this.sendMessage(session.sessionId, {
+								type: 'push_result',
+								serverClock: this.clock,
+								clientClock,
+								action: 'discard',
+							})
+						}
+					} else {
+						pushOutcomeAction = 'rebase'
+						span.setAttribute('tldraw.outcome', 'rebase')
+						// REBASE
+						// Applying the client's changes had a different non-empty effect on the server,
+						// so the client should rebase with our gold-standard / authoritative diff.
+						// First we need to migrate the diff to the client's version
+						if (session) {
+							const migrateResult = this.migrateDiffForSession(
+								session.serializedSchema,
+								docChanges.diff
+							)
+							if (!migrateResult.ok) {
+								return fail(
+									migrateResult.error === MigrationFailureReason.TargetVersionTooNew
+										? TLSyncErrorCloseEventReason.SERVER_TOO_OLD
+										: TLSyncErrorCloseEventReason.CLIENT_TOO_OLD
+								)
+							}
+							// If the migration worked, send the rebased diff to the client
+							this.sendMessage(session.sessionId, {
+								type: 'push_result',
+								serverClock: this.clock,
+								clientClock,
+								action: { rebaseWithDiff: migrateResult.value },
+							})
+						}
+					}
+
+					// If there are merged changes, broadcast them to all other clients
+					if (docChanges.diff || presenceChanges.diff) {
+						this.broadcastPatch({
+							sourceSessionId: session?.sessionId,
+							diff: {
+								...docChanges.diff,
+								...presenceChanges.diff,
+							},
+						})
+						didBroadcast = true
+					}
+
+					if (docChanges.diff) {
+						this.documentClock = this.clock
+					}
+					if (presenceChanges.diff) {
+						didPresenceChange = true
+					}
+
+					return
 				})
+
+				// if it threw the changes will have been rolled back and the document clock will not have been incremented
+				if (this.documentClock !== initialDocumentClock) {
+					this.onDataChange?.()
+				}
+
+				if (didPresenceChange) {
+					this.onPresenceChange?.()
+				}
+				setSafeAttributes(span, {
+					'tldraw.document.clock': this.documentClock,
+					'tldraw.server.clock': this.clock,
+					'tldraw.push_result.action': pushOutcomeAction,
+					'tldraw.push_result.broadcast': didBroadcast,
+				})
+				withSyncSpan(
+					'tlsync.room.push_outcome',
+					{
+						attributes: {
+							...getSyncTraceAttributes(),
+							'tldraw.room.session_id': session?.sessionId,
+							'tldraw.client.clock': message.clientClock,
+							'tldraw.room.clock': this.documentClock,
+							'tldraw.push_result.action': pushOutcomeAction,
+							'tldraw.push_result.broadcast': didBroadcast,
+							'tldraw.room.did_doc_change': this.documentClock !== initialDocumentClock,
+							'tldraw.room.did_presence_change': didPresenceChange,
+						},
+					},
+					() => {}
+				)
 			}
-
-			if (docChanges.diff) {
-				this.documentClock = this.clock
-			}
-			if (presenceChanges.diff) {
-				didPresenceChange = true
-			}
-
-			return
-		})
-
-		// if it threw the changes will have been rolled back and the document clock will not have been incremented
-		if (this.documentClock !== initialDocumentClock) {
-			this.onDataChange?.()
-		}
-
-		if (didPresenceChange) {
-			this.onPresenceChange?.()
-		}
+		)
 	}
 
 	/**

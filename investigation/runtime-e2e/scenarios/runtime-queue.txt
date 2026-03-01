@@ -1,0 +1,15 @@
+# One command per line. Commands run sequentially.
+# Keep scenarios low-parallelism for 8GB VM stability.
+
+# Install deps once per fresh container/workspace state
+yarn install --immutable
+
+# Example app e2e smoke (single worker)
+yarn workspace examples.tldraw.com e2e -- --project=chromium --workers=1
+
+# Dotcom e2e (single worker) - requires Clerk env vars and docker socket access
+# ./investigation/runtime-e2e/scripts/prepare-dotcom-env.sh
+# yarn e2e-dotcom -- --project=chromium --workers=1
+
+# Migration-focused runtime tests (optional but useful)
+# ./investigation/claims/run-claims.sh migrations

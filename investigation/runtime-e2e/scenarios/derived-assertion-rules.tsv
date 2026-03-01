@@ -1,0 +1,14 @@
+# path_regex	assertion_id	command	reason	class	profiles
+^packages/editor/	editor-test-ci	[ -d packages/editor ] && (cd packages/editor && yarn test-ci) || true	editor package changed	CORE	all
+^packages/tldraw/	tldraw-test-ci	[ -d packages/tldraw ] && (cd packages/tldraw && yarn test-ci) || true	tldraw package changed	CORE	all
+^packages/store/	store-test-ci	[ -d packages/store ] && (cd packages/store && yarn test-ci) || true	store package changed	CORE	all
+^packages/state/	state-test-ci	[ -d packages/state ] && (cd packages/state && yarn test-ci) || true	state package changed	CORE	all
+^packages/state-react/	state-react-test-ci	[ -d packages/state-react ] && (cd packages/state-react && yarn test-ci) || true	state-react package changed	CORE	all
+^packages/sync/	sync-test-ci	[ -d packages/sync ] && (cd packages/sync && yarn test-ci) || true	sync package changed	CORE	all
+^packages/sync-core/	sync-core-test-ci	[ -d packages/sync-core ] && (cd packages/sync-core && yarn test-ci) || true	sync-core package changed	CORE	all
+^packages/tlschema/	tlschema-test-ci	[ -d packages/tlschema ] && (cd packages/tlschema && yarn test-ci) || true	tlschema package changed	CORE	all
+^packages/validate/	validate-test-ci	[ -d packages/validate ] && (cd packages/validate && yarn test-ci) || true	validate package changed	CORE	all
+^packages/utils/	utils-test-ci	[ -d packages/utils ] && (cd packages/utils && yarn test-ci) || true	utils package changed	CORE	all
+^apps/examples/	examples-test-ci	[ -d apps/examples ] && (cd apps/examples && yarn test-ci) || true	examples runtime path changed	CORE	all
+schema|migration|migrations/	migration-suite	for p in packages/tlschema packages/store packages/sync-core; do [ -d "$p" ] && (cd "$p" && yarn test-ci); done	schema or migration signal	CORE	all
+^apps/dotcom/	dotcom-client-test-ci	[ -d apps/dotcom/client ] && (cd apps/dotcom/client && yarn test-ci) || true	dotcom code path changed	DOTCOM	dotcom,full

@@ -1,0 +1,9 @@
+# step_id	profiles	enabled	blocking	description
+yarn-install	all	1	1	Install dependencies
+yarn-test-ci	all	1	1	Run baseline CI tests
+derived-assertions	all	1	1	Run auto-derived per-commit assertions
+findings-assertions	all	1	1	Run findings-hypothesis assertions
+generate-hypothesis-tests	all	1	1	Generate hypothesis-specific tests from findings assertions
+run-generated-hypothesis-tests	all	1	1	Run generated hypothesis-specific tests and record outcomes
+static-assertions	full,dotcom	1	0	Run optional static assertions
+dotcom-assertions	dotcom	1	0	Run dotcom-specific assertions

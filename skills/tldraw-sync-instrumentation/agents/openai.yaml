@@ -1,0 +1,4 @@
+interface:
+  display_name: "tldraw Sync Instrumentation"
+  short_description: "Aggressive OTel spans for tldraw sync flows"
+  default_prompt: "Use $tldraw-sync-instrumentation to audit and instrument the tldraw sync change path end-to-end, then validate lint/tests."

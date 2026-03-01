@@ -46,6 +46,10 @@
 		"dev-ai": "LAZYREPO_PRETTY_OUTPUT=0 lazy run dev --filter='templates/ai'",
 		"dev-tools": "yarn tsx internal/scripts/get-pr-numbers.ts && lazy run dev --filter='internal/dev-tools'",
 		"dev-template": "./internal/scripts/dev-template.sh",
+		"otel:up": "docker compose -f internal/observability/otel/docker-compose.yml up -d",
+		"otel:down": "docker compose -f internal/observability/otel/docker-compose.yml down",
+		"otel:logs": "docker compose -f internal/observability/otel/docker-compose.yml logs -f",
+		"otel:watch-ui": "node internal/observability/otel/trace-watch-ui.mjs",
 		"build": "lazy build",
 		"build-app": "lazy run build --filter 'apps/dotcom/client'",
 		"build-docs": "lazy run build --filter 'apps/docs'",
@@ -145,5 +149,8 @@
 		"purgecss": "^5.0.0",
 		"sst": "^3.10.13",
 		"svgo": "^3.3.2"
+	},
+	"volta": {
+		"node": "20.20.0"
 	}
 }

@@ -66,6 +66,7 @@
 		]
 	},
 	"dependencies": {
+		"@opentelemetry/api": "^1.9.0",
 		"@tldraw/state": "workspace:*",
 		"@tldraw/store": "workspace:*",
 		"@tldraw/tlschema": "workspace:*",

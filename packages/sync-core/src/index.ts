@@ -17,6 +17,15 @@ export {
 	type ValueOp,
 } from './lib/diff'
 export {
+	attachTraceCarrier,
+	extractTraceContext,
+	getActiveTraceCarrier,
+	getSyncTracer,
+	recordSpanError,
+	setSafeAttributes,
+	withSyncSpan,
+} from './lib/otel'
+export {
 	getTlsyncProtocolVersion,
 	TLIncompatibilityReason,
 	type TLConnectRequest,
@@ -25,6 +34,7 @@ export {
 	type TLSocketClientSentEvent,
 	type TLSocketServerSentDataEvent,
 	type TLSocketServerSentEvent,
+	type TLTraceCarrier,
 } from './lib/protocol'
 export { RoomSessionState, type RoomSession } from './lib/RoomSession'
 export type { PersistedRoomSnapshotForSupabase } from './lib/server-types'
