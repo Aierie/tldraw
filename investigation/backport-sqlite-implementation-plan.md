@@ -257,3 +257,14 @@ Prove backport correctness and operational readiness.
 8. Observability feedback loop recorded (non-gating):
    - OTel SQLite span-family and connect/push `did_change` semantics reviewed and documented.
    - Findings are captured as diagnostic evidence of code-path behavior, not release-blocking acceptance criteria.
+
+## 9) Implementation Status (March 1, 2026)
+
+1. Phase A/B/C/D complete.
+   - Delivered via `89ecb2882`, `f3bfadd06`, `6774bd059`, `3fa9cdc96`.
+2. Claims removal / acceptance alignment complete.
+   - Delivered via `269a2a8f9`.
+3. Phase F complete (`sync-cloudflare` migration chain + sqlite DO class/binding/type wiring).
+   - Delivered via `78b52991a`, `a2eafe83f`, `dffa84446`.
+4. Phase G validation + reporting complete.
+   - Delivered via `08adccfc9`, `9f55b5734`, `8dd5f5648`, `35201cc41`.
