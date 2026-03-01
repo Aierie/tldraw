@@ -23,13 +23,17 @@
    - `corepack yarn workspace @tldraw/sync-core test --runInBand src/test/TLSocketRoom.test.ts`
    - `corepack yarn workspace @tldraw/sync-core test --runInBand src/test/InMemorySyncStorage.test.ts`
    - `corepack yarn workspace @tldraw/sync-core test --runInBand src/test/SQLiteSyncStorage.test.ts`
-   - Result: passing (Node 20 guard conditions respected where `node:sqlite` is unavailable).
+   - `corepack yarn workspace @tldraw/sync-core test --runInBand src/test/InMemorySyncStorage.test.ts -t "migrateStorage"`
+   - `corepack yarn workspace @tldraw/sync-core test --runInBand src/test/SQLiteSyncStorage.test.ts -t "wrapper-level"`
+   - `corepack yarn workspace @tldraw/sync-core test --runInBand src/test/SQLiteSyncStorage.test.ts -t "Migration from TEXT to BLOB"`
+   - Result: passing; Node 20 guard conditions respected where `node:sqlite` is unavailable (Node-dependent SQLite cases are skipped, wrapper-level migration checks still pass).
 2. Required OTel feedback loop (non-gating) rerun on March 1, 2026:
    - `./skills/tldraw-otel-lab/scripts/otel_lab.sh up --fresh --no-worker`
    - `corepack yarn workspace @tldraw/dotcom-worker playwright test -c ./e2e/playwright.config.ts ./e2e/tests/simple-sync-worker.spec.ts -g "essential canvas ops write to OTel traces"`
+   - `corepack yarn workspace @tldraw/dotcom-worker playwright test -c ./e2e/playwright.config.ts ./e2e/tests/simple-sync-worker.spec.ts`
    - `jq -r '.resourceSpans[].scopeSpans[].spans[].name' internal/observability/otel/data/traces.jsonl | sort -u | rg 'tlsync\\.client\\.push|tlsync\\.client\\.store_changes'`
    - `./skills/tldraw-otel-lab/scripts/otel_lab.sh down`
-   - Result: Playwright target passed; required client spans present (`tlsync.client.push`, `tlsync.client.store_changes`).
+   - Result: targeted and full simple worker e2e passed (6/6); required client spans present (`tlsync.client.push`, `tlsync.client.store_changes`).
 3. Cloudflare template wiring validation:
    - `corepack yarn workspace tldraw-sync-cloudflare tsc --noEmit`
    - Result: passing after sqlite DO class/binding/migration wiring backport.
