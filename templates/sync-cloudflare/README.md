@@ -8,8 +8,10 @@ This is a production-ready backend for [tldraw sync](https://tldraw.dev/docs/syn
 - Each whiteboard is synced via
   [WebSockets](https://developer.mozilla.org/en-US/docs/Web/API/WebSockets_API) to a [Cloudflare
   Durable Object](https://developers.cloudflare.com/durable-objects/).
-- Whiteboards and any uploaded images/videos are stored in a [Cloudflare
-  R2](https://developers.cloudflare.com/r2/) bucket.
+- Whiteboards are stored in [Cloudflare Durable Object SQLite
+  storage](https://developers.cloudflare.com/durable-objects/best-practices/access-durable-objects-storage/).
+- Uploaded images/videos are stored in a [Cloudflare R2](https://developers.cloudflare.com/r2/)
+  bucket.
 - Although unreliated to tldraw sync, this server also includes a component to fetch link previews
   for URLs added to the canvas.
   This is a minimal setup of the same system that powers multiplayer collaboration for hundreds of
@@ -26,15 +28,13 @@ This is a production-ready backend for [tldraw sync](https://tldraw.dev/docs/syn
 When a user opens a room, they connect via Workers to a durable object. Each durable object is like
 its own miniature server. There's only ever one for each room, and all the users of that room
 connect to it. When a user makes a change to the drawing, it's sent via a websocket connection to
-the durable object for that room. The durable object applies the change to its in-memory copy of the
-document, and broadcasts the change via websockets to all other connected clients. On a regular
-schedule, the durable object persists its contents to an R2 bucket. When the last client leaves the
-room, the durable object will shut down.
+the durable object for that room. The durable object applies the change through a SQLite-backed sync
+storage layer and broadcasts the change via websockets to all other connected clients. Room data is
+stored directly in Durable Object SQLite storage.
 
 Static assets like images and videos are too big to be synced via websockets and a durable object.
-Instead, they're uploaded to workers which store them in the same R2 bucket as the rooms. When
-they're downloaded, they're cached on cloudflare's edge network to reduce costs and make serving
-them faster.
+Instead, they're uploaded to workers which store them in R2. When they're downloaded, they're cached
+on cloudflare's edge network to reduce costs and make serving them faster.
 
 ## Development
 
@@ -48,10 +48,10 @@ The backend worker is under [`worker`](./worker/), and is split across several f
 
 - **[`worker/worker.ts`](./worker/worker.ts):** the main entrypoint to the worker, defining each
   route available.
-- **[`worker/TldrawDurableObject.ts`](./worker/TldrawDurableObject.ts):** the sync durable object.
-  An instance of this is created for every active room. This exposes a
-  [`TLSocketRoom`](https://tldraw.dev/reference/sync-core/TLSocketRoom) over websockets, and
-  periodically saves room data to R2.
+- **[`worker/TldrawDurableObjectSqlite.ts`](./worker/TldrawDurableObjectSqlite.ts):** the sync
+  durable object. An instance of this is created for every active room. This exposes a
+  [`TLSocketRoom`](https://tldraw.dev/reference/sync-core/TLSocketRoom) over websockets backed by
+  SQLite durable object storage.
 - **[`worker/assetUploads.ts`](./worker/assetUploads.ts):** uploads, downloads, and caching for
   static assets like images and videos.
 - **[`worker/bookmarkUnfurling.ts`](./worker/bookmarkUnfurling.ts):** extract URL metadata for bookmark shapes.

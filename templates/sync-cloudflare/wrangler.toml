@@ -15,7 +15,7 @@ enabled = true
 # Set up the durable object used for each tldraw room
 [durable_objects]
 bindings = [
-    { name = "TLDRAW_DURABLE_OBJECT", class_name = "TldrawDurableObject" },
+    { name = "TLDRAW_DURABLE_OBJECT", class_name = "TldrawDurableObjectSqlite" },
 ]
 
 # Durable objects require migrations to create/modify/delete them
@@ -23,7 +23,18 @@ bindings = [
 tag = "v1"
 new_classes = ["TldrawDurableObject"]
 
-# We store rooms and asset uploads in an R2 bucket
+# v2 was a no-op: classes_with_sqlite is not a valid Cloudflare migration directive
+[[migrations]]
+tag = "v2"
+classes_with_sqlite = ["TldrawDurableObject"]
+
+# New SQLite-backed class to replace KV-backed TldrawDurableObject
+[[migrations]]
+tag = "v3"
+deleted_classes = ["TldrawDurableObject"]
+new_sqlite_classes = ["TldrawDurableObjectSqlite"]
+
+# We store asset uploads in an R2 bucket.
 [[r2_buckets]]
 binding = 'TLDRAW_BUCKET'
 bucket_name = 'tldraw-content'
