@@ -1,6 +1,7 @@
 import { assert, objectMapEntries } from '@tldraw/utils'
 import { UnknownRecord } from './BaseRecord'
 import { SerializedStore } from './Store'
+import type { SerializedSchema } from './StoreSchema'
 
 let didWarn = false
 
@@ -168,7 +169,30 @@ export type Migration = {
 				newState: SerializedStore<UnknownRecord>
 			) => void | SerializedStore<UnknownRecord>
 	  }
+	| {
+			readonly scope: 'storage'
+			// eslint-disable-next-line @typescript-eslint/method-signature-style
+			readonly up: (storage: SynchronousRecordStorage<UnknownRecord>) => void
+			readonly down?: never
+	  }
 )
+
+/** @public */
+export interface SynchronousRecordStorage<R extends UnknownRecord> {
+	get(id: string): R | undefined
+	set(id: string, record: R): void
+	delete(id: string): void
+	keys(): Iterable<string>
+	values(): Iterable<R>
+	entries(): Iterable<[string, R]>
+}
+
+/** @public */
+export interface SynchronousStorage<R extends UnknownRecord>
+	extends SynchronousRecordStorage<R> {
+	getSchema(): SerializedSchema
+	setSchema(schema: SerializedSchema): void
+}
 
 /** @public */
 export interface LegacyBaseMigrationsInfo {

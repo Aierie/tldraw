@@ -3,6 +3,7 @@ import {
 	assert,
 	exhaustiveSwitchError,
 	getOwnProperty,
+	isEqual,
 	structuredClone,
 } from '@tldraw/utils'
 import { UnknownRecord } from './BaseRecord'
@@ -16,6 +17,7 @@ import {
 	MigrationSequence,
 	parseMigrationId,
 	sortMigrations,
+	SynchronousStorage,
 	validateMigrations,
 } from './migrate'
 
@@ -234,6 +236,16 @@ export class StoreSchema<R extends UnknownRecord, P = unknown> {
 			}
 		}
 
+		if (migrationsToApply.some((m) => m.scope === 'storage')) {
+			return {
+				type: 'error',
+				reason:
+					direction === 'down'
+						? MigrationFailureReason.TargetVersionTooOld
+						: MigrationFailureReason.TargetVersionTooNew,
+			}
+		}
+
 		if (direction === 'down') {
 			if (!migrationsToApply.every((m) => m.down)) {
 				return {
@@ -248,6 +260,7 @@ export class StoreSchema<R extends UnknownRecord, P = unknown> {
 		try {
 			for (const migration of migrationsToApply) {
 				if (migration.scope === 'store') throw new Error(/* won't happen, just for TS */)
+				if (migration.scope === 'storage') throw new Error(/* won't happen, just for TS */)
 				const shouldApply = migration.filter ? migration.filter(record) : true
 				if (!shouldApply) continue
 				const result = migration[direction]!(record)
@@ -263,47 +276,100 @@ export class StoreSchema<R extends UnknownRecord, P = unknown> {
 		return { type: 'success', value: record }
 	}
 
-	migrateStoreSnapshot(snapshot: StoreSnapshot<R>): MigrationResult<SerializedStore<R>> {
-		let { store } = snapshot
-		const migrations = this.getMigrationsSince(snapshot.schema)
+	migrateStorage(storage: SynchronousStorage<R>) {
+		const schema = storage.getSchema()
+		assert(schema, 'Schema is missing.')
+
+		const migrations = this.getMigrationsSince(schema)
 		if (!migrations.ok) {
-			// TODO: better error
 			console.error('Error migrating store', migrations.error)
-			return { type: 'error', reason: MigrationFailureReason.MigrationError }
+			throw new Error(migrations.error)
 		}
 		const migrationsToApply = migrations.value
 		if (migrationsToApply.length === 0) {
-			return { type: 'success', value: store }
+			return
 		}
 
-		store = structuredClone(store)
+		storage.setSchema(this.serialize())
+
+		for (const migration of migrationsToApply) {
+			if (migration.scope === 'record') {
+				// Stage updates after iteration to avoid mutating live cursors (e.g. sqlite).
+				const updates: [string, R][] = []
+				for (const [id, state] of storage.entries()) {
+					if (this.getType(state.typeName).scope !== 'document') continue
+					const shouldApply = migration.filter ? migration.filter(state) : true
+					if (!shouldApply) continue
+					const record = structuredClone(state)
+					const result = migration.up!(record as any) ?? record
+					if (!isEqual(result, state)) {
+						updates.push([id, result as R])
+					}
+				}
+				for (const [id, record] of updates) {
+					storage.set(id, record)
+				}
+			} else if (migration.scope === 'store') {
+				const prevStore = Object.fromEntries(storage.entries()) as Record<string, UnknownRecord>
+				let nextStore = structuredClone(prevStore)
+				nextStore = (migration.up!(nextStore as any) as any) ?? nextStore
+				for (const [id, state] of Object.entries(nextStore)) {
+					if (!state) continue
+					if (!isEqual(state, prevStore[id])) {
+						storage.set(id, state as R)
+					}
+				}
+				for (const id of Object.keys(prevStore)) {
+					if (!nextStore[id as keyof typeof nextStore]) {
+						storage.delete(id)
+					}
+				}
+			} else if (migration.scope === 'storage') {
+				migration.up(storage)
+			} else {
+				exhaustiveSwitchError(migration)
+			}
+		}
+
+		const nonDocumentIds: string[] = []
+		for (const [id, state] of storage.entries()) {
+			if (this.getType(state.typeName).scope !== 'document') {
+				nonDocumentIds.push(id)
+			}
+		}
+		for (const id of nonDocumentIds) {
+			storage.delete(id)
+		}
+	}
+
+	migrateStoreSnapshot(snapshot: StoreSnapshot<R>): MigrationResult<SerializedStore<R>> {
+		const migrations = this.getMigrationsSince(snapshot.schema)
+		if (!migrations.ok) {
+			console.error('Error migrating store', migrations.error)
+			return { type: 'error', reason: MigrationFailureReason.MigrationError }
+		}
+		if (migrations.value.length === 0) {
+			return { type: 'success', value: snapshot.store }
+		}
+
+		const storage = Object.assign(
+			new Map<string, R>(Object.entries(structuredClone(snapshot.store)) as [string, R][]),
+			{
+				getSchema: () => snapshot.schema,
+				setSchema: (_: SerializedSchema) => {},
+			}
+		) as Map<string, R> & SynchronousStorage<R>
 
 		try {
-			for (const migration of migrationsToApply) {
-				if (migration.scope === 'record') {
-					for (const [id, record] of Object.entries(store)) {
-						const shouldApply = migration.filter ? migration.filter(record as UnknownRecord) : true
-						if (!shouldApply) continue
-						const result = migration.up!(record as any)
-						if (result) {
-							store[id as keyof typeof store] = structuredClone(result) as any
-						}
-					}
-				} else if (migration.scope === 'store') {
-					const result = migration.up!(store)
-					if (result) {
-						store = structuredClone(result) as any
-					}
-				} else {
-					exhaustiveSwitchError(migration)
-				}
+			this.migrateStorage(storage)
+			return {
+				type: 'success',
+				value: Object.fromEntries(storage.entries()) as SerializedStore<R>,
 			}
 		} catch (e) {
 			console.error('Error migrating store', e)
 			return { type: 'error', reason: MigrationFailureReason.MigrationError }
 		}
-
-		return { type: 'success', value: store }
 	}
 
 	/** @internal */

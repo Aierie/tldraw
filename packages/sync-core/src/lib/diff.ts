@@ -89,7 +89,11 @@ export interface ObjectDiff {
 }
 
 /** @internal */
-export function diffRecord(prev: object, next: object): ObjectDiff | null {
+export function diffRecord(
+	prev: object,
+	next: object,
+	_legacyAppendMode = false
+): ObjectDiff | null {
 	return diffObject(prev, next, new Set(['props']))
 }
 

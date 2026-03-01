@@ -68,6 +68,16 @@ export const TLSyncErrorCloseEventReason = {
 	RATE_LIMITED: 'RATE_LIMITED',
 	ROOM_FULL: 'ROOM_FULL',
 } as const
+
+/** @internal */
+export class TLSyncError extends Error {
+	constructor(
+		message: string,
+		public reason: TLSyncErrorCloseEventReason
+	) {
+		super(message)
+	}
+}
 /**
  * The set of reasons that a connection can be closed by the server
  * @public

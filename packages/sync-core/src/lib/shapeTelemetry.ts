@@ -1,5 +1,6 @@
 import type { UnknownRecord } from '@tldraw/store'
 import { NetworkDiff, ObjectDiff, RecordOpType, ValueOpType } from './diff'
+import type { TLSyncForwardDiff } from './TLSyncStorage'
 
 interface ShapeLike {
 	typeName?: string
@@ -27,6 +28,28 @@ export function summarizeNetworkDiff<R extends UnknownRecord>(diff?: NetworkDiff
 		}
 	}
 	return { puts, patches, removes, total: puts + patches + removes }
+}
+
+export function summarizeForwardDiff(diff?: TLSyncForwardDiff<UnknownRecord>) {
+	if (!diff) {
+		return { puts: 0, updates: 0, deletes: 0, total: 0 }
+	}
+	let puts = 0
+	let updates = 0
+	for (const value of Object.values(diff.puts)) {
+		if (Array.isArray(value)) {
+			updates++
+		} else {
+			puts++
+		}
+	}
+	const deletes = diff.deletes.length
+	return {
+		puts,
+		updates,
+		deletes,
+		total: puts + updates + deletes,
+	}
 }
 
 function getShapeParentKind(parentId: unknown): 'shape' | 'page' | 'other' {

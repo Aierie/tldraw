@@ -1,4 +1,11 @@
-import { TLSocketRoom, withSyncSpan, type RoomSnapshot } from '@tldraw/sync-core'
+import {
+	DEFAULT_INITIAL_SNAPSHOT,
+	DurableObjectSqliteSyncWrapper,
+	SQLiteSyncStorage,
+	TLSocketRoom,
+	withSyncSpan,
+	type RoomSnapshot,
+} from '@tldraw/sync-core'
 import { createTLSchema, defaultShapeSchemas, type TLRecord } from '@tldraw/tlschema'
 import { DurableObject } from 'cloudflare:workers'
 import { AutoRouter, error, type IRequest } from 'itty-router'
@@ -30,21 +37,22 @@ export interface SimpleSyncWorkerEnvironment extends SimpleOtelEnvironment {
 
 export class SimpleTldrawDurableObject extends DurableObject<SimpleSyncWorkerEnvironment> {
 	private room: TLSocketRoom<TLRecord, void>
-	private readonly initialSnapshot: RoomSnapshot
+	private readonly sql: DurableObjectSqliteSyncWrapper
 
 	constructor(ctx: DurableObjectState, env: SimpleSyncWorkerEnvironment) {
 		super(ctx, env)
 		initSimpleOtel(env)
 
+		this.sql = new DurableObjectSqliteSyncWrapper(ctx.storage)
 		this.room = this.createRoom()
-		this.initialSnapshot = this.room.getCurrentSnapshot()
 	}
 
 	private createRoom(snapshot?: RoomSnapshot) {
-		return new TLSocketRoom<TLRecord, void>({
-			schema,
-			initialSnapshot: snapshot,
+		const storage = new SQLiteSyncStorage<TLRecord>({
+			sql: this.sql,
+			snapshot,
 		})
+		return new TLSocketRoom<TLRecord, void>({ schema, storage })
 	}
 
 	private readonly router = AutoRouter({ catch: (e) => error(e) })
@@ -122,7 +130,7 @@ export class SimpleTldrawDurableObject extends DurableObject<SimpleSyncWorkerEnv
 		}
 
 		this.room.close()
-		this.room = this.createRoom(this.initialSnapshot)
+		this.room = this.createRoom(DEFAULT_INITIAL_SNAPSHOT)
 		clearCapturedSimpleSpans()
 		return json({ ok: true })
 	}

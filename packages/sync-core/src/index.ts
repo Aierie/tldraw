@@ -1,5 +1,5 @@
 import { registerTldrawLibraryVersion } from '@tldraw/utils'
-export { chunk } from './lib/chunk'
+export { chunk, JsonChunkAssembler } from './lib/chunk'
 export { ClientWebSocketAdapter, ReconnectManager } from './lib/ClientWebSocketAdapter'
 export {
 	applyObjectDiff,
@@ -16,6 +16,20 @@ export {
 	type RecordOp,
 	type ValueOp,
 } from './lib/diff'
+export { DurableObjectSqliteSyncWrapper } from './lib/DurableObjectSqliteSyncWrapper'
+export { DEFAULT_INITIAL_SNAPSHOT, InMemorySyncStorage } from './lib/InMemorySyncStorage'
+export { NodeSqliteWrapper, type SyncSqliteDatabase } from './lib/NodeSqliteWrapper'
+export {
+	getTlsyncProtocolVersion,
+	TLIncompatibilityReason,
+	type TLConnectRequest,
+	type TLPingRequest,
+	type TLPushRequest,
+	type TLTraceCarrier,
+	type TLSocketClientSentEvent,
+	type TLSocketServerSentDataEvent,
+	type TLSocketServerSentEvent,
+} from './lib/protocol'
 export {
 	attachTraceCarrier,
 	extractTraceContext,
@@ -25,39 +39,60 @@ export {
 	setSafeAttributes,
 	withSyncSpan,
 } from './lib/otel'
-export {
-	getTlsyncProtocolVersion,
-	TLIncompatibilityReason,
-	type TLConnectRequest,
-	type TLPingRequest,
-	type TLPushRequest,
-	type TLSocketClientSentEvent,
-	type TLSocketServerSentDataEvent,
-	type TLSocketServerSentEvent,
-	type TLTraceCarrier,
-} from './lib/protocol'
-export { RoomSessionState, type RoomSession } from './lib/RoomSession'
+export { RoomSessionState, type RoomSession, type RoomSessionBase } from './lib/RoomSession'
 export type { PersistedRoomSnapshotForSupabase } from './lib/server-types'
 export type { WebSocketMinimal } from './lib/ServerSocketAdapter'
+export {
+	SQLiteSyncStorage,
+	type TLSqliteInputValue,
+	type TLSqliteOutputValue,
+	type TLSqliteRow,
+	type TLSyncSqliteStatement,
+	type TLSyncSqliteWrapper,
+	type TLSyncSqliteWrapperConfig,
+} from './lib/SQLiteSyncStorage'
+export {
+	summarizeForwardDiff,
+	summarizeNetworkDiff,
+	summarizeShapeHierarchyFromNetworkDiff,
+} from './lib/shapeTelemetry'
 export { TLRemoteSyncError } from './lib/TLRemoteSyncError'
-export { TLSocketRoom, type OmitVoid, type TLSyncLog } from './lib/TLSocketRoom'
+export {
+	TLSocketRoom,
+	type OmitVoid,
+	type RoomStoreMethods,
+	type TLSocketRoomOptions,
+	type TLSyncLog,
+} from './lib/TLSocketRoom'
 export {
 	TLSyncClient,
+	TLSyncError,
 	TLSyncErrorCloseEventCode,
 	TLSyncErrorCloseEventReason,
 	type SubscribingFn,
 	type TLPersistentClientSocket,
 	type TLPersistentClientSocketStatus,
-	type TlSocketStatusChangeEvent,
+	type TLSocketStatusChangeEvent,
 	type TLSocketStatusListener,
 } from './lib/TLSyncClient'
 export {
-	DocumentState,
 	TLSyncRoom,
+	type MinimalDocStore,
+	type PresenceStore,
 	type RoomSnapshot,
-	type RoomStoreMethods,
 	type TLRoomSocket,
 } from './lib/TLSyncRoom'
+export {
+	loadSnapshotIntoStorage,
+	type TLSyncForwardDiff,
+	type TLSyncStorage,
+	type TLSyncStorageGetChangesSinceResult,
+	type TLSyncStorageOnChangeCallbackProps,
+	type TLSyncStorageTransaction,
+	type TLSyncStorageTransactionCallback,
+	type TLSyncStorageTransactionOptions,
+	type TLSyncStorageTransactionResult,
+} from './lib/TLSyncStorage'
 
 registerTldrawLibraryVersion(
 	(globalThis as any).TLDRAW_LIBRARY_NAME,
