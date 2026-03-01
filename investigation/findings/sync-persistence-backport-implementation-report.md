@@ -16,6 +16,7 @@
 3. Phase F (`sync-cloudflare` migration and class/binding wiring):
    - `78b52991a` backport cloudflare sqlite durable object migration wiring
    - `a2eafe83f` remove legacy cloudflare kv durable object template path
+   - `dffa84446` normalize cloudflare sqlite migration noop tag
 
 ## Validation summary
 1. Sync-core/store test coverage (branch run history):
