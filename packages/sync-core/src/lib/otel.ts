@@ -14,7 +14,14 @@ import type { TLTraceCarrier } from './protocol'
 
 const tracer = trace.getTracer('@tldraw/sync-core', '1')
 
-const TRACE_KEYS = ['traceparent', 'tracestate'] as const
+const TRACE_KEYS = ['traceparent', 'tracestate', 'baggage'] as const
+
+export const SYNC_TRACE_BAGGAGE_KEYS = {
+	CANVAS_OP_ID: 'tldraw.canvas_op_id',
+	CANVAS_OP_KIND: 'tldraw.canvas_op_kind',
+	BATCH_ID: 'tldraw.sync.batch_id',
+	BATCH_COALESCED_COUNT: 'tldraw.sync.batch_coalesced_count',
+} as const
 
 const traceCarrierGetter: TextMapGetter<TLTraceCarrier> = {
 	keys(carrier) {
@@ -35,7 +42,7 @@ const traceCarrierGetter: TextMapGetter<TLTraceCarrier> = {
 const traceCarrierSetter: TextMapSetter<TLTraceCarrier> = {
 	set(carrier, key, value) {
 		const lowerKey = key.toLowerCase() as (typeof TRACE_KEYS)[number]
-		if (lowerKey === 'traceparent' || lowerKey === 'tracestate') {
+		if (lowerKey === 'traceparent' || lowerKey === 'tracestate' || lowerKey === 'baggage') {
 			carrier[lowerKey] = value
 		}
 	},
@@ -56,6 +63,32 @@ export function getTraceCarrierForContext(ctx: Context): TLTraceCarrier | undefi
 
 export function getActiveTraceCarrier(): TLTraceCarrier | undefined {
 	return getTraceCarrierForContext(context.active())
+}
+
+export function withSyncTraceAttributesContext(
+	attributes: Record<string, string | number | boolean | undefined>,
+	ctx: Context = context.active()
+): Context {
+	let baggage = propagation.getBaggage(ctx) ?? propagation.createBaggage()
+	let didSet = false
+	for (const [key, value] of Object.entries(attributes)) {
+		if (value === undefined || value === null) continue
+		baggage = baggage.setEntry(key, { value: String(value) })
+		didSet = true
+	}
+	if (!didSet) return ctx
+	return propagation.setBaggage(ctx, baggage)
+}
+
+export function getSyncTraceAttributes(ctx: Context = context.active()): Record<string, string> {
+	const baggage = propagation.getBaggage(ctx)
+	if (!baggage) return {}
+	const attrs: Record<string, string> = {}
+	for (const key of Object.values(SYNC_TRACE_BAGGAGE_KEYS)) {
+		const value = baggage.getEntry(key)?.value
+		if (value) attrs[key] = value
+	}
+	return attrs
 }
 
 export function attachTraceCarrier<T extends { trace?: TLTraceCarrier }>(

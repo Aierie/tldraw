@@ -1,3 +1,4 @@
+import { context, type Context } from '@opentelemetry/api'
 import {
 	AtomMap,
 	MigrationFailureReason,
@@ -6,7 +7,6 @@ import {
 	StoreSchema,
 	UnknownRecord,
 } from '@tldraw/store'
-import { context, type Context } from '@opentelemetry/api'
 import {
 	assert,
 	assertExists,
@@ -29,13 +29,19 @@ import {
 } from './diff'
 import { interval } from './interval'
 import {
+	attachTraceCarrier,
+	extractTraceContext,
+	getSyncTraceAttributes,
+	setSafeAttributes,
+	withSyncSpan,
+} from './otel'
+import {
 	getTlsyncProtocolVersion,
 	TLIncompatibilityReason,
 	TLSocketClientSentEvent,
 	TLSocketServerSentDataEvent,
 	TLSocketServerSentEvent,
 } from './protocol'
-import { attachTraceCarrier, extractTraceContext, setSafeAttributes, withSyncSpan } from './otel'
 import { applyAndDiffRecord, diffAndValidateRecord, validateRecord } from './recordDiff'
 import {
 	RoomSession,
@@ -44,6 +50,7 @@ import {
 	SESSION_REMOVAL_WAIT_TIME,
 	SESSION_START_WAIT_TIME,
 } from './RoomSession'
+import { summarizeNetworkDiff, summarizeShapeHierarchyFromNetworkDiff } from './shapeTelemetry'
 import { TLSyncLog } from './TLSocketRoom'
 import { TLSyncError, TLSyncErrorCloseEventCode, TLSyncErrorCloseEventReason } from './TLSyncClient'
 import {
@@ -52,10 +59,6 @@ import {
 	TLSyncStorageTransaction,
 	toNetworkDiff,
 } from './TLSyncStorage'
-import {
-	summarizeNetworkDiff,
-	summarizeShapeHierarchyFromNetworkDiff,
-} from './shapeTelemetry'
 
 /**
  * WebSocket interface for server-side room connections. This defines the contract
@@ -318,6 +321,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 			'tlsync.socket.server.send',
 			{
 				attributes: {
+					...getSyncTraceAttributes(),
 					'tldraw.msg.type': message.type,
 					'tldraw.room.session_id': sessionId,
 					'tldraw.room.readonly': session.isReadonly,
@@ -340,17 +344,19 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 					const tracedDataMessage = tracedMessage as TLSocketServerSentDataEvent<R>
 					if (session.debounceTimer === null) {
 						// this is the first message since the last flush, don't delay it
-						const batch: Extract<TLSocketServerSentEvent<R>, { type: 'data' }> =
-							tracedDataMessage.trace
-								? {
-										type: 'data',
-										data: [tracedDataMessage],
-										trace: tracedDataMessage.trace,
-									}
-								: {
-										type: 'data',
-										data: [tracedDataMessage],
-									}
+						const batch: Extract<
+							TLSocketServerSentEvent<R>,
+							{ type: 'data' }
+						> = tracedDataMessage.trace
+							? {
+									type: 'data',
+									data: [tracedDataMessage],
+									trace: tracedDataMessage.trace,
+								}
+							: {
+									type: 'data',
+									data: [tracedDataMessage],
+								}
 						span.setAttribute('tldraw.msg.bytes', JSON.stringify(batch).length)
 						session.socket.sendMessage(batch)
 
@@ -380,6 +386,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 			'tlsync.socket.server.flush_data',
 			{
 				attributes: {
+					...getSyncTraceAttributes(),
 					'tldraw.room.session_id': sessionId,
 					'tldraw.msg.buffered': session.outstandingDataMessages.length,
 				},
@@ -497,6 +504,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 			'tlsync.room.broadcast_patch',
 			{
 				attributes: {
+					...getSyncTraceAttributes(),
 					'tldraw.room.clock': this.lastDocumentClock,
 					'tldraw.room.sessions': this.sessions.size,
 					...summarizeNetworkDiff(unmigrated),
@@ -720,6 +728,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 			'tlsync.room.handle_message',
 			{
 				attributes: {
+					...getSyncTraceAttributes(traceContext),
 					'tldraw.msg.type': message.type,
 					'tldraw.room.session_id': sessionId,
 					'tldraw.room.readonly': session.isReadonly,
@@ -924,6 +933,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 			'tlsync.room.connect',
 			{
 				attributes: {
+					...getSyncTraceAttributes(),
 					'tldraw.msg.type': 'connect',
 					'tldraw.room.session_id': session.sessionId,
 					'tldraw.client.last_server_clock': message.lastServerClock,
@@ -1124,6 +1134,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 			'tlsync.room.push',
 			{
 				attributes: {
+					...getSyncTraceAttributes(traceContext),
 					'tldraw.msg.type': 'push',
 					'tldraw.room.session_id': session?.sessionId,
 					'tldraw.room.readonly': !!session?.isReadonly,
@@ -1142,7 +1153,12 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 						const docChanges: ActualChanges = { diffs: null }
 						const presenceChanges: ActualChanges = { diffs: null }
 
-						if (this.presenceType && session?.presenceId && 'presence' in message && message.presence) {
+						if (
+							this.presenceType &&
+							session?.presenceId &&
+							'presence' in message &&
+							message.presence
+						) {
 							if (!session) throw new Error('session is required for presence pushes')
 							// The push request was for the presence scope.
 							const id = session.presenceId
@@ -1216,7 +1232,10 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 					'tldraw.room.did_change': txResult.didChange,
 				})
 				if (txResult.changes) {
-					setSafeAttributes(span, summarizeShapeHierarchyFromNetworkDiff(toNetworkDiff(txResult.changes)))
+					setSafeAttributes(
+						span,
+						summarizeShapeHierarchyFromNetworkDiff(toNetworkDiff(txResult.changes))
+					)
 				}
 				return txResult
 			},
@@ -1229,6 +1248,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 			'tlsync.room.push_outcome',
 			{
 				attributes: {
+					...getSyncTraceAttributes(),
 					'tldraw.room.session_id': session?.sessionId,
 					'tldraw.client.clock': message.clientClock,
 					'tldraw.room.clock': documentClock,

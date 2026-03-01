@@ -7,6 +7,21 @@ import {
 } from './SQLiteSyncStorage'
 import { withSyncSpan } from './otel'
 
+const MAX_DB_STATEMENT_LENGTH = 400
+
+function getDbStatementAttributes(sql: string) {
+	const normalized = sql.replace(/\s+/g, ' ').trim()
+	const wasTruncated = normalized.length > MAX_DB_STATEMENT_LENGTH
+	const statement = wasTruncated
+		? `${normalized.slice(0, MAX_DB_STATEMENT_LENGTH - 3)}...`
+		: normalized
+
+	return {
+		'db.statement': statement,
+		'tldraw.db.statement_truncated': wasTruncated,
+	}
+}
+
 /**
  * Minimal interface for a synchronous SQLite database.
  *
@@ -81,6 +96,7 @@ export class NodeSqliteWrapper implements TLSyncSqliteWrapper {
 				attributes: {
 					'db.system': 'sqlite',
 					'db.operation': 'exec',
+					...getDbStatementAttributes(sql),
 				},
 			},
 			() => {

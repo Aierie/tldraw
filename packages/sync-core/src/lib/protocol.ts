@@ -80,6 +80,7 @@ export type TLIncompatibilityReason =
 export interface TLTraceCarrier {
 	traceparent?: string
 	tracestate?: string
+	baggage?: string
 }
 
 /**

@@ -156,4 +156,5 @@ export class SimpleTldrawDurableObject extends DurableObject<SimpleSyncWorkerEnv
 		clearCapturedSimpleSpans()
 		return json({ ok: true })
 	}
+
 }

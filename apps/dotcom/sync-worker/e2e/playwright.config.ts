@@ -23,11 +23,23 @@ export default defineConfig({
 			},
 		},
 	],
-	webServer: {
-		command: 'yarn dev-simple',
-		url: 'http://127.0.0.1:8790/health',
-		reuseExistingServer: !process.env.CI,
-		cwd: path.join(__dirname, '..'),
-		timeout: 120_000,
-	},
+	webServer: [
+		{
+			command: 'yarn dev-simple',
+			url: 'http://127.0.0.1:8790/health',
+			reuseExistingServer: !process.env.CI,
+			cwd: path.join(__dirname, '..'),
+			timeout: 120_000,
+		},
+		{
+			command: 'yarn dev-simple-client',
+			url: 'http://127.0.0.1:5173',
+			reuseExistingServer: !process.env.CI,
+			cwd: path.join(__dirname, '..'),
+			timeout: 120_000,
+			env: {
+				VITE_SIMPLE_SYNC_WORKER_BASE_URL: 'http://127.0.0.1:8790',
+			},
+		},
+	],
 })
