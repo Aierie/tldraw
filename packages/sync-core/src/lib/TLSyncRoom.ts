@@ -1521,10 +1521,20 @@ class StoreUpdateContext<R extends UnknownRecord> implements RoomStoreMethods<R>
 
 	getAll(): R[] {
 		if (this._isClosed) throw new Error('StoreUpdateContext is closed')
-		return Object.values(this.snapshot)
-			.filter((r): r is R => !!r)
-			.filter((r) => !this.updates.deletes.has(r.id))
-			.map((r) => structuredClone((this.updates.puts[r.id] ?? r) as R))
+		const records: R[] = []
+		const seen = new Set<string>()
+		for (const r of Object.values(this.snapshot)) {
+			if (!r) continue
+			if (this.updates.deletes.has(r.id)) continue
+			records.push(structuredClone((this.updates.puts[r.id] ?? r) as R))
+			seen.add(r.id)
+		}
+		for (const [id, r] of Object.entries(this.updates.puts)) {
+			if (seen.has(id)) continue
+			if (this.updates.deletes.has(id)) continue
+			records.push(structuredClone(r as R))
+		}
+		return records
 	}
 
 	private _isClosed = false

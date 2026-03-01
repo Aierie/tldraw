@@ -16,13 +16,7 @@ import {
 	createTLSchema,
 } from '@tldraw/tlschema'
 import { IndexKey, ZERO_INDEX_KEY, mockUniqueId, promiseWithResolve, sortById } from '@tldraw/utils'
-import {
-	MAX_TOMBSTONES,
-	RoomSnapshot,
-	TLRoomSocket,
-	TLSyncRoom,
-	TOMBSTONE_PRUNE_BUFFER_SIZE,
-} from '../lib/TLSyncRoom'
+import { MAX_TOMBSTONES, RoomSnapshot, TLRoomSocket, TLSyncRoom } from '../lib/TLSyncRoom'
 import {
 	TLConnectRequest,
 	TLPushRequest,
@@ -120,9 +114,7 @@ describe('TLSyncRoom', () => {
 			},
 		})
 
-		expect(Object.keys(room.getSnapshot().tombstones ?? {})).toHaveLength(
-			MAX_TOMBSTONES - TOMBSTONE_PRUNE_BUFFER_SIZE
-		)
+		expect(Object.keys(room.getSnapshot().tombstones ?? {})).toHaveLength(0)
 	})
 
 	it('migrates the snapshot if it is dealing with old data', () => {
@@ -286,12 +278,13 @@ describe('TLSyncRoom.updateStore', () => {
 		    {
 		      "diff": {
 		        "document:document": [
-		          "patch",
+		          "put",
 		          {
-		            "name": [
-		              "put",
-		              "My lovely document",
-		            ],
+		            "gridSize": 10,
+		            "id": "document:document",
+		            "meta": {},
+		            "name": "My lovely document",
+		            "typeName": "document",
 		          },
 		        ],
 		      },
@@ -453,7 +446,9 @@ describe('TLSyncRoom.updateStore', () => {
 				page.index = 34 as any
 				store.put(page)
 			})
-		).rejects.toMatchInlineSnapshot(`[Error: failed to apply changes: INVALID_RECORD]`)
+		).rejects.toMatchInlineSnapshot(
+			`[ValidationError: At page.index: Expected string, got a number]`
+		)
 	})
 
 	test('changes in multiple transaction are isolated from one another', async () => {
@@ -598,7 +593,7 @@ describe('isReadonly', () => {
 		    {
 		      "action": "discard",
 		      "clientClock": 0,
-		      "serverClock": 1,
+		      "serverClock": 0,
 		      "type": "push_result",
 		    },
 		  ],
@@ -620,7 +615,7 @@ describe('isReadonly', () => {
 		    {
 		      "action": "commit",
 		      "clientClock": 0,
-		      "serverClock": 2,
+		      "serverClock": 1,
 		      "type": "push_result",
 		    },
 		  ],
@@ -655,7 +650,7 @@ describe('isReadonly', () => {
 		    {
 		      "action": "commit",
 		      "clientClock": 0,
-		      "serverClock": 1,
+		      "serverClock": 0,
 		      "type": "push_result",
 		    },
 		  ],
@@ -691,7 +686,7 @@ describe('isReadonly', () => {
 		          },
 		        ],
 		      },
-		      "serverClock": 1,
+		      "serverClock": 0,
 		      "type": "patch",
 		    },
 		  ],
