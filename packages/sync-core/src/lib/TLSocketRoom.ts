@@ -1,4 +1,5 @@
 import type { StoreSchema, UnknownRecord } from '@tldraw/store'
+import { context } from '@opentelemetry/api'
 import { createTLSchema, TLStoreSnapshot } from '@tldraw/tlschema'
 import { getOwnProperty, hasOwnProperty, isEqual, structuredClone } from '@tldraw/utils'
 import { DEFAULT_INITIAL_SNAPSHOT, InMemorySyncStorage } from './InMemorySyncStorage'
@@ -269,42 +270,53 @@ export class TLSocketRoom<R extends UnknownRecord = UnknownRecord, SessionMeta =
 		} & (SessionMeta extends void ? object : { meta: SessionMeta })
 	) {
 		const { sessionId, socket, isReadonly = false } = opts
-		const handleSocketMessage = (event: MessageEvent) =>
-			this.handleSocketMessage(sessionId, event.data)
-		const handleSocketError = this.handleSocketError.bind(this, sessionId)
-		const handleSocketClose = this.handleSocketClose.bind(this, sessionId)
-
-		this.sessions.set(sessionId, {
-			assembler: new JsonChunkAssembler(),
-			socket,
-			unlisten: () => {
-				socket.removeEventListener?.('message', handleSocketMessage)
-				socket.removeEventListener?.('close', handleSocketClose)
-				socket.removeEventListener?.('error', handleSocketError)
+		withSyncSpan(
+			'tlsync.socket.server.connect',
+			{
+				attributes: {
+					'tldraw.room.session_id': sessionId,
+					'tldraw.room.readonly': isReadonly,
+				},
 			},
-		})
+			() => {
+				const handleSocketMessage = (event: MessageEvent) =>
+					this.handleSocketMessage(sessionId, event.data)
+				const handleSocketError = this.handleSocketError.bind(this, sessionId)
+				const handleSocketClose = this.handleSocketClose.bind(this, sessionId)
 
-		this.room.handleNewSession({
-			sessionId,
-			isReadonly,
-			socket: new ServerSocketAdapter({
-				ws: socket,
-				onBeforeSendMessage: this.opts.onBeforeSendMessage
-					? (message, stringified) =>
-							this.opts.onBeforeSendMessage!({
-								sessionId,
-								message,
-								stringified,
-								meta: this.room.sessions.get(sessionId)?.meta as SessionMeta,
-							})
-					: undefined,
-			}),
-			meta: 'meta' in opts ? (opts.meta as any) : undefined,
-		})
+				this.sessions.set(sessionId, {
+					assembler: new JsonChunkAssembler(),
+					socket,
+					unlisten: () => {
+						socket.removeEventListener?.('message', handleSocketMessage)
+						socket.removeEventListener?.('close', handleSocketClose)
+						socket.removeEventListener?.('error', handleSocketError)
+					},
+				})
 
-		socket.addEventListener?.('message', handleSocketMessage)
-		socket.addEventListener?.('close', handleSocketClose)
-		socket.addEventListener?.('error', handleSocketError)
+				this.room.handleNewSession({
+					sessionId,
+					isReadonly,
+					socket: new ServerSocketAdapter({
+						ws: socket,
+						onBeforeSendMessage: this.opts.onBeforeSendMessage
+							? (message, stringified) =>
+									this.opts.onBeforeSendMessage!({
+										sessionId,
+										message,
+										stringified,
+										meta: this.room.sessions.get(sessionId)?.meta as SessionMeta,
+									})
+							: undefined,
+					}),
+					meta: 'meta' in opts ? (opts.meta as any) : undefined,
+				})
+
+				socket.addEventListener?.('message', handleSocketMessage)
+				socket.addEventListener?.('close', handleSocketClose)
+				socket.addEventListener?.('error', handleSocketError)
+			}
+		)
 	}
 
 	/**
@@ -339,58 +351,69 @@ export class TLSocketRoom<R extends UnknownRecord = UnknownRecord, SessionMeta =
 			this.log?.warn?.('Received message from unknown session', sessionId)
 			return
 		}
+		withSyncSpan(
+			'tlsync.socket.server.assemble',
+			{
+				attributes: {
+					'tldraw.room.session_id': sessionId,
+					'tldraw.msg.bytes':
+						typeof message === 'string' ? message.length : (message.byteLength ?? 0),
+				},
+			},
+			() => {
+				try {
+					const messageString =
+						typeof message === 'string' ? message : new TextDecoder().decode(message)
+					const res = assembler.handleMessage(messageString)
+					if (!res) {
+						// not enough chunks yet
+						return
+					}
+					if ('data' in res) {
+						const clientMessage = res.data as TLSocketClientSentEvent<R>
+						const parentContext = extractTraceContext(clientMessage.trace)
+						void withSyncSpan(
+							'tlsync.socket.server.receive',
+							{
+								attributes: {
+									'tldraw.msg.type': clientMessage.type,
+									'tldraw.msg.bytes': res.stringified.length,
+								},
+							},
+							() => {
+								// need to do this first in case the session gets removed as a result of handling the message
+								if (this.opts.onAfterReceiveMessage) {
+									const session = this.room.sessions.get(sessionId)
+									if (session) {
+										this.opts.onAfterReceiveMessage({
+											sessionId,
+											message: res.data as any,
+											stringified: res.stringified,
+											meta: session.meta,
+										})
+									}
+								}
 
-		try {
-			const messageString =
-				typeof message === 'string' ? message : new TextDecoder().decode(message)
-			const res = assembler.handleMessage(messageString)
-			if (!res) {
-				// not enough chunks yet
-				return
-			}
-			if ('data' in res) {
-				const clientMessage = res.data as TLSocketClientSentEvent<R>
-				const parentContext = extractTraceContext(clientMessage.trace)
-				void withSyncSpan(
-					'tlsync.socket.server.receive',
-					{
-						attributes: {
-							'tldraw.msg.type': clientMessage.type,
-							'tldraw.msg.bytes': res.stringified.length,
-						},
-					},
-					() => {
-						// need to do this first in case the session gets removed as a result of handling the message
-						if (this.opts.onAfterReceiveMessage) {
-							const session = this.room.sessions.get(sessionId)
-							if (session) {
-								this.opts.onAfterReceiveMessage({
-									sessionId,
-									message: res.data as any,
-									stringified: res.stringified,
-									meta: session.meta,
-								})
-							}
-						}
-
-						return this.room.handleMessage(sessionId, clientMessage)
-					},
-					parentContext
-				).catch((error) => {
-					this.log?.error?.(error)
+								return this.room.handleMessage(sessionId, clientMessage, context.active())
+							},
+							parentContext
+						).catch((error) => {
+							this.log?.error?.(error)
+							this.room.rejectSession(sessionId, TLSyncErrorCloseEventReason.UNKNOWN_ERROR)
+						})
+					} else {
+						this.log?.error?.('Error assembling message', res.error)
+						// close the socket to reset the connection
+						this.handleSocketError(sessionId)
+					}
+				} catch (e) {
+					this.log?.error?.(e)
+					// here we use rejectSession rather than removeSession to support legacy clients
+					// that use the old incompatibility_error close event
 					this.room.rejectSession(sessionId, TLSyncErrorCloseEventReason.UNKNOWN_ERROR)
-				})
-			} else {
-				this.log?.error?.('Error assembling message', res.error)
-				// close the socket to reset the connection
-				this.handleSocketError(sessionId)
+				}
 			}
-		} catch (e) {
-			this.log?.error?.(e)
-			// here we use rejectSession rather than removeSession to support legacy clients
-			// that use the old incompatibility_error close event
-			this.room.rejectSession(sessionId, TLSyncErrorCloseEventReason.UNKNOWN_ERROR)
-		}
+		)
 	}
 
 	/**
@@ -409,7 +432,17 @@ export class TLSocketRoom<R extends UnknownRecord = UnknownRecord, SessionMeta =
 	 * ```
 	 */
 	handleSocketError(sessionId: string) {
-		this.room.handleClose(sessionId)
+		withSyncSpan(
+			'tlsync.socket.server.error',
+			{
+				attributes: {
+					'tldraw.room.session_id': sessionId,
+				},
+			},
+			() => {
+				this.room.handleClose(sessionId)
+			}
+		)
 	}
 
 	/**
@@ -428,7 +461,17 @@ export class TLSocketRoom<R extends UnknownRecord = UnknownRecord, SessionMeta =
 	 * ```
 	 */
 	handleSocketClose(sessionId: string) {
-		this.room.handleClose(sessionId)
+		withSyncSpan(
+			'tlsync.socket.server.close',
+			{
+				attributes: {
+					'tldraw.room.session_id': sessionId,
+				},
+			},
+			() => {
+				this.room.handleClose(sessionId)
+			}
+		)
 	}
 
 	/**

@@ -5065,7 +5065,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@opentelemetry/context-async-hooks@npm:2.5.1":
+"@opentelemetry/context-async-hooks@npm:2.5.1, @opentelemetry/context-async-hooks@npm:^2.5.1":
   version: 2.5.1
   resolution: "@opentelemetry/context-async-hooks@npm:2.5.1"
   peerDependencies:
@@ -10213,11 +10213,13 @@ __metadata:
     "@clerk/backend": "npm:^1.23.7"
     "@cloudflare/workers-types": "npm:^4.20250913.0"
     "@opentelemetry/api": "npm:^1.9.0"
+    "@opentelemetry/context-async-hooks": "npm:^2.5.1"
     "@opentelemetry/exporter-trace-otlp-http": "npm:^0.207.0"
     "@opentelemetry/resources": "npm:^2.1.0"
     "@opentelemetry/sdk-trace-base": "npm:^2.1.0"
     "@opentelemetry/semantic-conventions": "npm:^1.38.0"
     "@pierre/storage": "npm:^1.1.0"
+    "@playwright/test": "npm:^1.58.2"
     "@rocicorp/zero": "npm:0.25.9"
     "@supabase/auth-helpers-remix": "npm:^0.2.6"
     "@supabase/supabase-js": "npm:^2.48.1"

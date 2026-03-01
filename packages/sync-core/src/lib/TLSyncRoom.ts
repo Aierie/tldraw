@@ -6,6 +6,7 @@ import {
 	StoreSchema,
 	UnknownRecord,
 } from '@tldraw/store'
+import { context, type Context } from '@opentelemetry/api'
 import {
 	assert,
 	assertExists,
@@ -309,37 +310,62 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 			this.log?.warn?.('Tried to send message to disconnected client', message.type)
 			return
 		}
-		if (session.socket.isOpen) {
-			const tracedMessage = message.trace ? message : attachTraceCarrier(message as any)
-			if (tracedMessage.type !== 'patch' && tracedMessage.type !== 'push_result') {
-				// this is not a data message
-				if (tracedMessage.type !== 'pong') {
-					// non-data messages like "connect" might still need to be ordered correctly with
-					// respect to data messages, so it's better to flush just in case
-					this._flushDataMessages(sessionId)
-				}
-				session.socket.sendMessage(tracedMessage as TLSocketServerSentEvent<R>)
-			} else {
-				const tracedDataMessage = tracedMessage as TLSocketServerSentDataEvent<R>
-				if (session.debounceTimer === null) {
-					// this is the first message since the last flush, don't delay it
-					session.socket.sendMessage({
-						type: 'data',
-						data: [tracedDataMessage],
-						trace: tracedDataMessage.trace,
-					})
-
-					session.debounceTimer = setTimeout(
-						() => this._flushDataMessages(sessionId),
-						DATA_MESSAGE_DEBOUNCE_INTERVAL
-					)
+		if (!session.socket.isOpen) {
+			this.cancelSession(session.sessionId)
+			return
+		}
+		withSyncSpan(
+			'tlsync.socket.server.send',
+			{
+				attributes: {
+					'tldraw.msg.type': message.type,
+					'tldraw.room.session_id': sessionId,
+					'tldraw.room.readonly': session.isReadonly,
+					'tldraw.msg.buffered': session.outstandingDataMessages.length,
+				},
+			},
+			(span) => {
+				const tracedMessage = message.trace ? message : attachTraceCarrier(message as any)
+				if (tracedMessage.type !== 'patch' && tracedMessage.type !== 'push_result') {
+					// this is not a data message
+					if (tracedMessage.type !== 'pong') {
+						// non-data messages like "connect" might still need to be ordered correctly with
+						// respect to data messages, so it's better to flush just in case
+						this._flushDataMessages(sessionId)
+					}
+					const payload = JSON.stringify(tracedMessage)
+					span.setAttribute('tldraw.msg.bytes', payload.length)
+					session.socket.sendMessage(tracedMessage as TLSocketServerSentEvent<R>)
 				} else {
-					session.outstandingDataMessages.push(tracedDataMessage)
+					const tracedDataMessage = tracedMessage as TLSocketServerSentDataEvent<R>
+					if (session.debounceTimer === null) {
+						// this is the first message since the last flush, don't delay it
+						const batch: Extract<TLSocketServerSentEvent<R>, { type: 'data' }> =
+							tracedDataMessage.trace
+								? {
+										type: 'data',
+										data: [tracedDataMessage],
+										trace: tracedDataMessage.trace,
+									}
+								: {
+										type: 'data',
+										data: [tracedDataMessage],
+									}
+						span.setAttribute('tldraw.msg.bytes', JSON.stringify(batch).length)
+						session.socket.sendMessage(batch)
+
+						session.debounceTimer = setTimeout(
+							() => this._flushDataMessages(sessionId),
+							DATA_MESSAGE_DEBOUNCE_INTERVAL
+						)
+					} else {
+						session.outstandingDataMessages.push(tracedDataMessage)
+						span.setAttribute('tldraw.msg.debounced', true)
+						span.setAttribute('tldraw.msg.buffered_after', session.outstandingDataMessages.length)
+					}
 				}
 			}
-		} else {
-			this.cancelSession(session.sessionId)
-		}
+		)
 	}
 
 	// needs to accept sessionId and not a session because the session might be dead by the time
@@ -350,17 +376,36 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 		if (!session || session.state !== RoomSessionState.Connected) {
 			return
 		}
+		withSyncSpan(
+			'tlsync.socket.server.flush_data',
+			{
+				attributes: {
+					'tldraw.room.session_id': sessionId,
+					'tldraw.msg.buffered': session.outstandingDataMessages.length,
+				},
+			},
+			(span) => {
+				session.debounceTimer = null
 
-		session.debounceTimer = null
-
-		if (session.outstandingDataMessages.length > 0) {
-			session.socket.sendMessage({
-				type: 'data',
-				data: session.outstandingDataMessages,
-				trace: session.outstandingDataMessages[0]?.trace,
-			})
-			session.outstandingDataMessages.length = 0
-		}
+				if (session.outstandingDataMessages.length > 0) {
+					const firstTrace = session.outstandingDataMessages[0]?.trace
+					const batch: Extract<TLSocketServerSentEvent<R>, { type: 'data' }> = firstTrace
+						? {
+								type: 'data',
+								data: session.outstandingDataMessages,
+								trace: firstTrace,
+							}
+						: {
+								type: 'data',
+								data: session.outstandingDataMessages,
+							}
+					span.setAttribute('tldraw.msg.batch_count', session.outstandingDataMessages.length)
+					span.setAttribute('tldraw.msg.bytes', JSON.stringify(batch).length)
+					session.socket.sendMessage(batch)
+					session.outstandingDataMessages.length = 0
+				}
+			}
+		)
 	}
 
 	/** @internal */
@@ -651,6 +696,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 	 *
 	 * @param sessionId - The ID of the session that sent the message
 	 * @param message - The client message to process
+	 * @param traceContext - Optional pre-extracted trace context when already available
 	 * @example
 	 * ```ts
 	 * // Typically called by WebSocket message handlers
@@ -660,13 +706,16 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 	 * })
 	 * ```
 	 */
-	async handleMessage(sessionId: string, message: TLSocketClientSentEvent<R>) {
+	async handleMessage(
+		sessionId: string,
+		message: TLSocketClientSentEvent<R>,
+		traceContext: Context = extractTraceContext(message.trace)
+	) {
 		const session = this.sessions.get(sessionId)
 		if (!session) {
 			this.log?.warn?.('Received message from unknown session')
 			return
 		}
-		const parentContext = extractTraceContext(message.trace)
 		return withSyncSpan(
 			'tlsync.room.handle_message',
 			{
@@ -683,7 +732,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 							return this.handleConnectRequest(session, message)
 						}
 						case 'push': {
-							return this.handlePushRequest(session, message)
+							return this.handlePushRequest(session, message, context.active())
 						}
 						case 'ping': {
 							if (session.state === RoomSessionState.Connected) {
@@ -704,7 +753,7 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 					}
 				}
 			},
-			parentContext
+			traceContext
 		)
 	}
 
@@ -726,46 +775,62 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 	rejectSession(sessionId: string, fatalReason?: TLSyncErrorCloseEventReason | string) {
 		const session = this.sessions.get(sessionId)
 		if (!session) return
-		if (!fatalReason) {
-			this.removeSession(sessionId)
-			return
-		}
-		if (session.requiresLegacyRejection) {
-			try {
-				if (session.socket.isOpen) {
-					// eslint-disable-next-line @typescript-eslint/no-deprecated
-					let legacyReason: TLIncompatibilityReason
-					switch (fatalReason) {
-						case TLSyncErrorCloseEventReason.CLIENT_TOO_OLD:
-							// eslint-disable-next-line @typescript-eslint/no-deprecated
-							legacyReason = TLIncompatibilityReason.ClientTooOld
-							break
-						case TLSyncErrorCloseEventReason.SERVER_TOO_OLD:
-							// eslint-disable-next-line @typescript-eslint/no-deprecated
-							legacyReason = TLIncompatibilityReason.ServerTooOld
-							break
-						case TLSyncErrorCloseEventReason.INVALID_RECORD:
-							// eslint-disable-next-line @typescript-eslint/no-deprecated
-							legacyReason = TLIncompatibilityReason.InvalidRecord
-							break
-						default:
-							// eslint-disable-next-line @typescript-eslint/no-deprecated
-							legacyReason = TLIncompatibilityReason.InvalidOperation
-							break
-					}
-					session.socket.sendMessage({
-						type: 'incompatibility_error',
-						reason: legacyReason,
-					})
+		withSyncSpan(
+			'tlsync.room.reject_session',
+			{
+				attributes: {
+					'tldraw.room.session_id': sessionId,
+					'tldraw.room.reason': fatalReason ?? 'none',
+					'tldraw.room.legacy_rejection': session.requiresLegacyRejection,
+				},
+			},
+			() => {
+				if (!fatalReason) {
+					this.removeSession(sessionId)
+					return
 				}
-			} catch {
-				// noop
-			} finally {
-				this.removeSession(sessionId)
+				if (session.requiresLegacyRejection) {
+					try {
+						if (session.socket.isOpen) {
+							// eslint-disable-next-line @typescript-eslint/no-deprecated
+							let legacyReason: TLIncompatibilityReason
+							switch (fatalReason) {
+								case TLSyncErrorCloseEventReason.CLIENT_TOO_OLD:
+									// eslint-disable-next-line @typescript-eslint/no-deprecated
+									legacyReason = TLIncompatibilityReason.ClientTooOld
+									break
+								case TLSyncErrorCloseEventReason.SERVER_TOO_OLD:
+									// eslint-disable-next-line @typescript-eslint/no-deprecated
+									legacyReason = TLIncompatibilityReason.ServerTooOld
+									break
+								case TLSyncErrorCloseEventReason.INVALID_RECORD:
+									// eslint-disable-next-line @typescript-eslint/no-deprecated
+									legacyReason = TLIncompatibilityReason.InvalidRecord
+									break
+								default:
+									// eslint-disable-next-line @typescript-eslint/no-deprecated
+									legacyReason = TLIncompatibilityReason.InvalidOperation
+									break
+							}
+							const legacyMessage: Extract<
+								TLSocketServerSentEvent<R>,
+								{ type: 'incompatibility_error' }
+							> = {
+								type: 'incompatibility_error',
+								reason: legacyReason,
+							}
+							session.socket.sendMessage(attachTraceCarrier(legacyMessage))
+						}
+					} catch {
+						// noop
+					} finally {
+						this.removeSession(sessionId)
+					}
+				} else {
+					this.removeSession(sessionId, fatalReason)
+				}
 			}
-		} else {
-			this.removeSession(sessionId, fatalReason)
-		}
+		)
 	}
 
 	private forceAllReconnect() {
@@ -921,7 +986,8 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 
 	private handlePushRequest(
 		session: RoomSession<R, SessionMeta> | null,
-		message: Extract<TLSocketClientSentEvent<R>, { type: 'push' }>
+		message: Extract<TLSocketClientSentEvent<R>, { type: 'push' }>,
+		traceContext: Context = context.active()
 	) {
 		// We must be connected to handle push requests
 		if (session && session.state !== RoomSessionState.Connected) {
@@ -932,7 +998,6 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 			session.lastInteractionTime = Date.now()
 		}
 
-		const parentContext = extractTraceContext(message.trace)
 		const legacyAppendMode = !this.getCanEmitStringAppend()
 
 		interface ActualChanges {
@@ -1155,74 +1220,101 @@ export class TLSyncRoom<R extends UnknownRecord, SessionMeta> {
 				}
 				return txResult
 			},
-			parentContext
+			traceContext
 		)
 
 		this.lastDocumentClock = documentClock
 
-		let pushResult: TLSocketServerSentEvent<R> | undefined
-		if (changes && session) {
-			// txn did not apply verbatim so we should broadcast the actual changes
-			result.docChanges.diffs = { networkDiff: toNetworkDiff(changes) ?? {}, diff: changes }
-		}
+		withSyncSpan(
+			'tlsync.room.push_outcome',
+			{
+				attributes: {
+					'tldraw.room.session_id': session?.sessionId,
+					'tldraw.client.clock': message.clientClock,
+					'tldraw.room.clock': documentClock,
+					'tldraw.room.did_doc_change': !!result.docChanges.diffs,
+					'tldraw.room.did_presence_change': !!result.presenceChanges.diffs,
+				},
+			},
+			(span) => {
+				let pushResult: Extract<TLSocketServerSentEvent<R>, { type: 'push_result' }> | undefined
+				if (changes && session) {
+					// txn did not apply verbatim so we should broadcast the actual changes
+					result.docChanges.diffs = { networkDiff: toNetworkDiff(changes) ?? {}, diff: changes }
+				}
 
-		if (isEqual(result.docChanges.diffs?.networkDiff, message.diff)) {
-			pushResult = {
-				type: 'push_result',
-				clientClock: message.clientClock,
-				serverClock: documentClock,
-				action: 'commit',
-			}
-		} else if (!result.docChanges.diffs?.networkDiff) {
-			pushResult = {
-				type: 'push_result',
-				clientClock: message.clientClock,
-				serverClock: documentClock,
-				action: 'discard',
-			}
-		} else if (session) {
-			// if recordsDiff is null but diff is not, then there are no clients that need down migrations
-			// so we can just use the diff directly
-			const diff = this.migrateDiffOrRejectSession(
-				session.sessionId,
-				session.serializedSchema,
-				session.requiresDownMigrations,
-				result.docChanges.diffs.diff,
-				result.docChanges.diffs.networkDiff
-			)
-			if (diff.ok) {
-				pushResult = {
-					type: 'push_result',
-					clientClock: message.clientClock,
-					serverClock: documentClock,
-					action: { rebaseWithDiff: diff.value },
+				if (isEqual(result.docChanges.diffs?.networkDiff, message.diff)) {
+					pushResult = {
+						type: 'push_result',
+						clientClock: message.clientClock,
+						serverClock: documentClock,
+						action: 'commit',
+					}
+				} else if (!result.docChanges.diffs?.networkDiff) {
+					pushResult = {
+						type: 'push_result',
+						clientClock: message.clientClock,
+						serverClock: documentClock,
+						action: 'discard',
+					}
+				} else if (session) {
+					// if recordsDiff is null but diff is not, then there are no clients that need down migrations
+					// so we can just use the diff directly
+					const diff = this.migrateDiffOrRejectSession(
+						session.sessionId,
+						session.serializedSchema,
+						session.requiresDownMigrations,
+						result.docChanges.diffs.diff,
+						result.docChanges.diffs.networkDiff
+					)
+					if (diff.ok) {
+						pushResult = {
+							type: 'push_result',
+							clientClock: message.clientClock,
+							serverClock: documentClock,
+							action: { rebaseWithDiff: diff.value },
+						}
+					}
+					// if the difff was not ok then the session was rejected and it's ok to continue without a push result
+				}
+
+				if (session && pushResult) {
+					span.setAttribute(
+						'tldraw.push_result.action',
+						pushResult.action === 'commit'
+							? 'commit'
+							: pushResult.action === 'discard'
+								? 'discard'
+								: 'rebase'
+					)
+					this._unsafe_sendMessage(session.sessionId, attachTraceCarrier(pushResult))
+				} else {
+					span.setAttribute('tldraw.push_result.action', 'none')
+				}
+				if (result.docChanges.diffs || result.presenceChanges.diffs) {
+					this.broadcastPatch(
+						{
+							puts: {
+								...result.docChanges.diffs?.diff.puts,
+								...result.presenceChanges.diffs?.diff.puts,
+							},
+							deletes: [
+								...(result.docChanges.diffs?.diff.deletes ?? []),
+								...(result.presenceChanges.diffs?.diff.deletes ?? []),
+							],
+						},
+						{
+							...result.docChanges.diffs?.networkDiff,
+							...result.presenceChanges.diffs?.networkDiff,
+						},
+						session?.sessionId
+					)
+					span.setAttribute('tldraw.push_result.broadcast', true)
+				} else {
+					span.setAttribute('tldraw.push_result.broadcast', false)
 				}
 			}
-			// if the difff was not ok then the session was rejected and it's ok to continue without a push result
-		}
-
-		if (session && pushResult) {
-			this._unsafe_sendMessage(session.sessionId, attachTraceCarrier(pushResult))
-		}
-		if (result.docChanges.diffs || result.presenceChanges.diffs) {
-			this.broadcastPatch(
-				{
-					puts: {
-						...result.docChanges.diffs?.diff.puts,
-						...result.presenceChanges.diffs?.diff.puts,
-					},
-					deletes: [
-						...(result.docChanges.diffs?.diff.deletes ?? []),
-						...(result.presenceChanges.diffs?.diff.deletes ?? []),
-					],
-				},
-				{
-					...result.docChanges.diffs?.networkDiff,
-					...result.presenceChanges.diffs?.networkDiff,
-				},
-				session?.sessionId
-			)
-		}
+		)
 
 		if (result.presenceChanges.diffs) {
 			queueMicrotask(() => {

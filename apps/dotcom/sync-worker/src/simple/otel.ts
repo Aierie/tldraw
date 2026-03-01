@@ -15,12 +15,17 @@ import { resourceFromAttributes } from '@opentelemetry/resources'
 import {
 	BasicTracerProvider,
 	BatchSpanProcessor,
+	InMemorySpanExporter,
 	ParentBasedSampler,
+	SimpleSpanProcessor,
 	TraceIdRatioBasedSampler,
+	type ReadableSpan,
+	type SpanProcessor,
 } from '@opentelemetry/sdk-trace-base'
 
 export interface SimpleOtelEnvironment {
 	OTEL_ENABLED?: string
+	OTEL_CAPTURE_SPANS?: string
 	OTEL_EXPORTER_OTLP_ENDPOINT?: string
 	OTEL_EXPORTER_OTLP_HEADERS?: string
 	OTEL_SAMPLE_RATIO?: string
@@ -31,9 +36,18 @@ export interface SimpleOtelEnvironment {
 let didInitialize = false
 let provider: BasicTracerProvider | null = null
 let didSetContextManager = false
+let capturedSpansExporter: InMemorySpanExporter | null = null
+
+function shouldCaptureSpans(env: SimpleOtelEnvironment) {
+	return env.OTEL_CAPTURE_SPANS === 'true'
+}
+
+function shouldExportOtel(env: SimpleOtelEnvironment) {
+	return env.OTEL_ENABLED === 'true' && !!env.OTEL_EXPORTER_OTLP_ENDPOINT
+}
 
 function isEnabled(env: SimpleOtelEnvironment) {
-	return env.OTEL_ENABLED === 'true' && !!env.OTEL_EXPORTER_OTLP_ENDPOINT
+	return shouldCaptureSpans(env) || shouldExportOtel(env)
 }
 
 function clampSampleRatio(value: string | undefined): number {
@@ -74,10 +88,26 @@ export function initSimpleOtel(env: SimpleOtelEnvironment) {
 		didSetContextManager = true
 	}
 
-	const exporter = new OTLPTraceExporter({
-		url: env.OTEL_EXPORTER_OTLP_ENDPOINT,
-		headers: parseHeaders(env.OTEL_EXPORTER_OTLP_HEADERS),
-	})
+	const spanProcessors: SpanProcessor[] = []
+
+	if (shouldExportOtel(env)) {
+		const exporter = new OTLPTraceExporter({
+			url: env.OTEL_EXPORTER_OTLP_ENDPOINT,
+			headers: parseHeaders(env.OTEL_EXPORTER_OTLP_HEADERS),
+		})
+		spanProcessors.push(
+			new BatchSpanProcessor(exporter, {
+				scheduledDelayMillis: 500,
+				maxExportBatchSize: 64,
+				maxQueueSize: 256,
+			})
+		)
+	}
+
+	if (shouldCaptureSpans(env)) {
+		capturedSpansExporter = new InMemorySpanExporter()
+		spanProcessors.push(new SimpleSpanProcessor(capturedSpansExporter))
+	}
 
 	provider = new BasicTracerProvider({
 		resource: resourceFromAttributes({
@@ -88,13 +118,7 @@ export function initSimpleOtel(env: SimpleOtelEnvironment) {
 		sampler: new ParentBasedSampler({
 			root: new TraceIdRatioBasedSampler(clampSampleRatio(env.OTEL_SAMPLE_RATIO)),
 		}),
-		spanProcessors: [
-			new BatchSpanProcessor(exporter, {
-				scheduledDelayMillis: 500,
-				maxExportBatchSize: 64,
-				maxQueueSize: 256,
-			}),
-		],
+		spanProcessors,
 	})
 
 	trace.setGlobalTracerProvider(provider)
@@ -103,6 +127,37 @@ export function initSimpleOtel(env: SimpleOtelEnvironment) {
 export async function flushSimpleOtel() {
 	if (!provider) return
 	await provider.forceFlush()
+}
+
+function hrToUnixMs(hr: [number, number]) {
+	return hr[0] * 1000 + hr[1] / 1_000_000
+}
+
+export interface CapturedSimpleSpan {
+	name: string
+	attributes: Record<string, unknown>
+	statusCode: number
+	startTimeUnixMs: number
+	endTimeUnixMs: number
+}
+
+function serializeSpan(span: ReadableSpan): CapturedSimpleSpan {
+	return {
+		name: span.name,
+		attributes: span.attributes,
+		statusCode: span.status.code,
+		startTimeUnixMs: hrToUnixMs(span.startTime),
+		endTimeUnixMs: hrToUnixMs(span.endTime),
+	}
+}
+
+export function getCapturedSimpleSpans(): CapturedSimpleSpan[] {
+	if (!capturedSpansExporter) return []
+	return capturedSpansExporter.getFinishedSpans().map(serializeSpan)
+}
+
+export function clearCapturedSimpleSpans() {
+	capturedSpansExporter?.reset()
 }
 
 const headersGetter: TextMapGetter<Headers> = {

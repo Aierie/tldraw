@@ -15,6 +15,7 @@ This folder contains a local OTel sink + live UI setup for investigating sync be
 Instrumentation has been added in `packages/sync-core` at the main sync boundaries:
 
 - `TLSyncClient` (frontend store changes, push/connect send, server receive)
+- `apps/dotcom/sync-worker/src/simple/worker.ts` initializes a browser OTLP exporter for local demo pages on `localhost` / `127.0.0.1` so `tlsync.client.*` and `tlsync.socket.client.*` spans are captured
 - `apps/dotcom/sync-worker/src/otel.ts` initializes Worker/DO OTLP exporter when `OTEL_ENABLED=true`
 - `ClientWebSocketAdapter` (websocket send/receive boundaries)
 - `TLSocketRoom` (server socket message ingress)
@@ -106,3 +107,4 @@ rg -o '"parentSpanId":"[0-9a-f]+"' internal/observability/otel/data/traces.jsonl
 - How messages route through socket + room handlers (`tlsync.socket.*`, `tlsync.room.*`)
 - When and how SQLite persistence transactions happen (`tlsync.storage.sqlite.*`)
 - Shape hierarchy movement hints (parent/page/shape/reparent attributes on room/storage spans)
+- End-to-end client→server change sequence map: [`SYNC_CHANGE_SEQUENCE.md`](./SYNC_CHANGE_SEQUENCE.md)

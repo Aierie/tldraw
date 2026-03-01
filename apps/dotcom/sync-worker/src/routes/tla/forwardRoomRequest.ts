@@ -13,24 +13,35 @@ export async function forwardRoomRequest(request: IRequest, env: Environment): P
 		{
 			attributes: {
 				'tldraw.msg.type': 'forward_room_request',
+				'http.method': request.method,
+				'http.path': new URL(request.url).pathname,
 			},
 		},
-		(span) => {
+		async (span) => {
 			const roomId = request.params.roomId
 			span.setAttribute('tldraw.room_id', roomId ?? 'missing')
 
-			if (!roomId) return notFound()
-			if (isRoomIdTooLong(roomId)) return roomIdIsTooLong()
+			if (!roomId) {
+				span.setAttribute('tldraw.request.outcome', 'room_not_found')
+				return notFound()
+			}
+			if (isRoomIdTooLong(roomId)) {
+				span.setAttribute('tldraw.request.outcome', 'room_id_too_long')
+				return roomIdIsTooLong()
+			}
 
 			// Set up the durable object for this room
 			const id = env.TLDR_DOC.idFromName(`/${ROOM_PREFIX}/${roomId}`)
-			return env.TLDR_DOC.get(id).fetch(
+			const response = await env.TLDR_DOC.get(id).fetch(
 				new Request(request.url, {
 					method: request.method,
 					headers: injectTraceHeaders(request.headers),
 					body: request.body,
 				})
 			)
+			span.setAttribute('http.status_code', response.status)
+			span.setAttribute('tldraw.request.outcome', 'forwarded_to_room')
+			return response
 		}
 	)
 }

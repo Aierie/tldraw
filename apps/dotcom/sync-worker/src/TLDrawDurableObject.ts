@@ -459,156 +459,216 @@ export class TLFileDurableObject extends DurableObject {
 
 	async onRequest(req: IRequest, openMode: RoomOpenMode) {
 		const requestTimer = this.timer()
+		const requestUrl = new URL(req.url)
+		return withSyncSpan(
+			'tlsync.worker.do.on_request',
+			{
+				attributes: {
+					'http.method': req.method,
+					'http.path': requestUrl.pathname,
+					'tldraw.room_id': this.documentInfo.slug,
+					'tldraw.room.is_app': this.documentInfo.isApp,
+					'tldraw.room.open_mode.initial': openMode,
+				},
+			},
+			async (span) => {
+				// extract query params from request, should include instanceId
+				const params = Object.fromEntries(requestUrl.searchParams.entries())
+				let { sessionId, storeId } = params
 
-		// extract query params from request, should include instanceId
-		const url = new URL(req.url)
-		const params = Object.fromEntries(url.searchParams.entries())
-		let { sessionId, storeId } = params
+				// handle legacy param names
+				sessionId ??= params.sessionKey ?? params.instanceId
+				storeId ??= params.localClientId
+				const isNewSession = !this._room
+				span.setAttribute('tldraw.session_id', sessionId ?? 'missing')
+				span.setAttribute('tldraw.store_id', storeId ?? 'missing')
 
-		// handle legacy param names
-		sessionId ??= params.sessionKey ?? params.instanceId
-		storeId ??= params.localClientId
-		const isNewSession = !this._room
+				// Create the websocket pair for the client
+				const { 0: clientWebSocket, 1: serverWebSocket } = new WebSocketPair()
+				serverWebSocket.accept()
 
-		// Create the websocket pair for the client
-		const { 0: clientWebSocket, 1: serverWebSocket } = new WebSocketPair()
-		serverWebSocket.accept()
+				const closeSocket = (reason: TLSyncErrorCloseEventReason) => {
+					span.setAttribute('tldraw.request.outcome', 'socket_closed')
+					span.setAttribute('tldraw.request.close_reason', reason)
+					serverWebSocket.close(TLSyncErrorCloseEventCode, reason)
+					return new Response(null, { status: 101, webSocket: clientWebSocket })
+				}
 
-		const closeSocket = (reason: TLSyncErrorCloseEventReason) => {
-			serverWebSocket.close(TLSyncErrorCloseEventCode, reason)
-			return new Response(null, { status: 101, webSocket: clientWebSocket })
-		}
-
-		if (this.documentInfo.deleted) {
-			return closeSocket(TLSyncErrorCloseEventReason.NOT_FOUND)
-		}
-
-		const authTimer = this.timer()
-		const auth = await getAuth(req, this.env)
-		authTimer.report('on_request_auth')
-
-		if (this.documentInfo.isApp) {
-			openMode = ROOM_OPEN_MODE.READ_WRITE
-			const file = await this.getAppFileRecord()
-
-			if (file) {
-				if (file.isDeleted) {
+				if (this.documentInfo.deleted) {
 					return closeSocket(TLSyncErrorCloseEventReason.NOT_FOUND)
 				}
 
-				if (isTestFile(file.id) && !(await canAccessTestProductionFile(this.env, auth))) {
-					return closeSocket(TLSyncErrorCloseEventReason.NOT_FOUND)
-				}
+				const authTimer = this.timer()
+				const auth = await withSyncSpan(
+					'tlsync.worker.do.on_request.auth',
+					{
+						attributes: {
+							'tldraw.session_id': sessionId ?? 'missing',
+						},
+					},
+					() => getAuth(req, this.env)
+				)
+				authTimer.report('on_request_auth')
+				span.setAttribute('tldraw.user.authenticated', !!auth?.userId)
+				if (auth?.userId) span.setAttribute('tldraw.user_id', auth.userId)
 
-				if (!auth && !file.shared) {
-					return closeSocket(TLSyncErrorCloseEventReason.NOT_AUTHENTICATED)
-				}
+				if (this.documentInfo.isApp) {
+					openMode = ROOM_OPEN_MODE.READ_WRITE
+					const file = await withSyncSpan('tlsync.worker.do.on_request.get_file', {}, () =>
+						this.getAppFileRecord()
+					)
 
-				const rateLimitTimer = this.timer()
-				if (auth?.userId) {
-					const rateLimited = await isRateLimited(this.env, auth.userId)
-					if (rateLimited) {
-						this.logEvent({
-							type: 'client',
-							userId: auth.userId,
-							localClientId: storeId,
-							name: 'rate_limited',
-						})
-						return closeSocket(TLSyncErrorCloseEventReason.RATE_LIMITED)
+					if (file) {
+						span.setAttribute('tldraw.file.shared', !!file.shared)
+						span.setAttribute('tldraw.file.shared_link_type', file.sharedLinkType ?? 'none')
+
+						if (file.isDeleted) {
+							return closeSocket(TLSyncErrorCloseEventReason.NOT_FOUND)
+						}
+
+						if (
+							isTestFile(file.id) &&
+							!(await withSyncSpan(
+								'tlsync.worker.do.on_request.test_file_access',
+								() => canAccessTestProductionFile(this.env, auth)
+							))
+						) {
+							return closeSocket(TLSyncErrorCloseEventReason.NOT_FOUND)
+						}
+
+						if (!auth && !file.shared) {
+							return closeSocket(TLSyncErrorCloseEventReason.NOT_AUTHENTICATED)
+						}
+
+						const rateLimitTimer = this.timer()
+						const rateLimited = await withSyncSpan(
+							'tlsync.worker.do.on_request.rate_limit',
+							{
+								attributes: {
+									'tldraw.user_id': auth?.userId ?? 'anonymous',
+									'tldraw.session_id': sessionId ?? 'missing',
+								},
+							},
+							() => isRateLimited(this.env, auth?.userId ?? sessionId)
+						)
+						if (rateLimited) {
+							this.logEvent({
+								type: 'client',
+								userId: auth?.userId,
+								localClientId: storeId,
+								name: 'rate_limited',
+							})
+							return closeSocket(TLSyncErrorCloseEventReason.RATE_LIMITED)
+						}
+						rateLimitTimer.report('on_request_rate_limit')
+
+						// Check if user has owner access (directly or via group membership)
+						let hasOwnerAccess = false
+						if (file.ownerId && file.ownerId === auth?.userId) {
+							hasOwnerAccess = true
+						} else if (file.owningGroupId && auth?.userId) {
+							// Check if user is a member of the owning group
+							const groupCheckTimer = this.timer()
+							const groupMember = await withSyncSpan(
+								'tlsync.worker.do.on_request.group_check',
+								{
+									attributes: {
+										'tldraw.group_id': file.owningGroupId,
+										'tldraw.user_id': auth.userId,
+									},
+								},
+								() =>
+									this.db
+										.selectFrom('group_user')
+										.where('groupId', '=', file.owningGroupId)
+										.where('userId', '=', auth.userId)
+										.executeTakeFirst()
+							)
+							groupCheckTimer.report('on_request_group_check')
+
+							if (groupMember) {
+								hasOwnerAccess = true
+							}
+						}
+
+						if (!hasOwnerAccess) {
+							if (!file.shared) {
+								return closeSocket(TLSyncErrorCloseEventReason.FORBIDDEN)
+							}
+							if (file.sharedLinkType === 'view') {
+								openMode = ROOM_OPEN_MODE.READ_ONLY
+							}
+						}
 					}
 				} else {
-					const rateLimited = await isRateLimited(this.env, sessionId)
-					if (rateLimited) {
+					// Legacy rooms are now read-only
+					openMode = ROOM_OPEN_MODE.READ_ONLY
+				}
+				span.setAttribute('tldraw.room.open_mode.final', openMode)
+
+				try {
+					const getRoomTimer = this.timer()
+					const room = await withSyncSpan('tlsync.worker.do.on_request.get_room', {}, () =>
+						this.getRoom()
+					)
+					getRoomTimer.report('on_request_get_room')
+
+					// Don't connect if we're already at max connections
+					if (room.getNumActiveSessions() > MAX_CONNECTIONS) {
+						return closeSocket(TLSyncErrorCloseEventReason.ROOM_FULL)
+					}
+
+					// all good
+					withSyncSpan(
+						'tlsync.worker.do.on_request.connect_socket',
+						{
+							attributes: {
+								'tldraw.session_id': sessionId ?? 'missing',
+								'tldraw.store_id': storeId ?? 'missing',
+								'tldraw.room.readonly': openMode === ROOM_OPEN_MODE.READ_ONLY,
+							},
+						},
+						() => {
+							room.handleSocketConnect({
+								sessionId: sessionId,
+								socket: serverWebSocket,
+								meta: {
+									storeId,
+									userId: auth?.userId ? auth.userId : null,
+								},
+								isReadonly: openMode === ROOM_OPEN_MODE.READ_ONLY,
+							})
+						}
+					)
+					if (isNewSession) {
 						this.logEvent({
 							type: 'client',
-							userId: auth?.userId,
+							roomId: this.documentInfo.slug,
+							name: 'room_reopen',
+							instanceId: sessionId,
 							localClientId: storeId,
-							name: 'rate_limited',
 						})
-						return closeSocket(TLSyncErrorCloseEventReason.RATE_LIMITED)
 					}
-				}
-				rateLimitTimer.report('on_request_rate_limit')
+					this.logEvent({
+						type: 'client',
+						roomId: this.documentInfo.slug,
+						name: 'enter',
+						instanceId: sessionId,
+						localClientId: storeId,
+					})
 
-				// Check if user has owner access (directly or via group membership)
-				let hasOwnerAccess = false
-				if (file.ownerId && file.ownerId === auth?.userId) {
-					hasOwnerAccess = true
-				} else if (file.owningGroupId && auth?.userId) {
-					// Check if user is a member of the owning group
-					const groupCheckTimer = this.timer()
-					const groupMember = await this.db
-						.selectFrom('group_user')
-						.where('groupId', '=', file.owningGroupId)
-						.where('userId', '=', auth.userId)
-						.executeTakeFirst()
-					groupCheckTimer.report('on_request_group_check')
+					requestTimer.report('on_request_total')
+					span.setAttribute('tldraw.request.outcome', 'connected')
 
-					if (groupMember) {
-						hasOwnerAccess = true
+					return new Response(null, { status: 101, webSocket: clientWebSocket })
+				} catch (e) {
+					if (e === ROOM_NOT_FOUND) {
+						return closeSocket(TLSyncErrorCloseEventReason.NOT_FOUND)
 					}
-				}
-
-				if (!hasOwnerAccess) {
-					if (!file.shared) {
-						return closeSocket(TLSyncErrorCloseEventReason.FORBIDDEN)
-					}
-					if (file.sharedLinkType === 'view') {
-						openMode = ROOM_OPEN_MODE.READ_ONLY
-					}
+					throw e
 				}
 			}
-		} else {
-			// Legacy rooms are now read-only
-			openMode = ROOM_OPEN_MODE.READ_ONLY
-		}
-
-		try {
-			const getRoomTimer = this.timer()
-			const room = await this.getRoom()
-			getRoomTimer.report('on_request_get_room')
-
-			// Don't connect if we're already at max connections
-			if (room.getNumActiveSessions() > MAX_CONNECTIONS) {
-				return closeSocket(TLSyncErrorCloseEventReason.ROOM_FULL)
-			}
-
-			// all good
-			room.handleSocketConnect({
-				sessionId: sessionId,
-				socket: serverWebSocket,
-				meta: {
-					storeId,
-					userId: auth?.userId ? auth.userId : null,
-				},
-				isReadonly: openMode === ROOM_OPEN_MODE.READ_ONLY,
-			})
-			if (isNewSession) {
-				this.logEvent({
-					type: 'client',
-					roomId: this.documentInfo.slug,
-					name: 'room_reopen',
-					instanceId: sessionId,
-					localClientId: storeId,
-				})
-			}
-			this.logEvent({
-				type: 'client',
-				roomId: this.documentInfo.slug,
-				name: 'enter',
-				instanceId: sessionId,
-				localClientId: storeId,
-			})
-
-			requestTimer.report('on_request_total')
-
-			return new Response(null, { status: 101, webSocket: clientWebSocket })
-		} catch (e) {
-			if (e === ROOM_NOT_FOUND) {
-				return closeSocket(TLSyncErrorCloseEventReason.NOT_FOUND)
-			}
-			throw e
-		}
+		)
 	}
 
 	triggerPersist = throttle(() => {

@@ -13,6 +13,7 @@ enabled = true
 
 [vars]
 OTEL_ENABLED = "false"
+OTEL_CAPTURE_SPANS = "true"
 OTEL_SAMPLE_RATIO = "1"
 OTEL_SERVICE_NAME = "tldraw-sync-core-simple-worker"
 WORKER_ENV = "development"

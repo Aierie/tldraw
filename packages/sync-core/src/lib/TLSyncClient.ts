@@ -624,29 +624,52 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 			// handle switching between online and offline
 			this.socket.onStatusChange((ev) => {
 				if (this.didCancel?.()) return this.close()
-				this.debug('socket status changed', ev.status)
-				if (ev.status === 'online') {
-					this.sendConnectMessage()
-				} else {
-					this.resetConnection()
-					if (ev.status === 'error') {
-						didLoad = true
-						config.onSyncError(ev.reason)
-						this.close()
+				withSyncSpan(
+					'tlsync.client.socket_status_change',
+					{
+						attributes: this.getTelemetryAttributes({
+							'tldraw.socket.status': ev.status,
+							'tldraw.socket.reason': ev.status === 'error' ? ev.reason : undefined,
+						}),
+					},
+					() => {
+						this.debug('socket status changed', ev.status)
+						if (ev.status === 'online') {
+							this.sendConnectMessage()
+						} else {
+							this.resetConnection()
+							if (ev.status === 'error') {
+								didLoad = true
+								config.onSyncError(ev.reason)
+								this.close()
+							}
+						}
 					}
-				}
+				)
 			}),
 			// Send a ping every PING_INTERVAL ms while online
 			interval(() => {
 				if (this.didCancel?.()) return this.close()
 				this.debug('ping loop', { isConnectedToRoom: this.isConnectedToRoom })
 				if (!this.isConnectedToRoom) return
-				try {
-					this.socket.sendMessage(attachTraceCarrier({ type: 'ping' }))
-				} catch (error) {
-					console.warn('ping failed, resetting', error)
-					this.resetConnection()
-				}
+				withSyncSpan(
+					'tlsync.client.ping',
+					{
+						attributes: this.getTelemetryAttributes({
+							'tldraw.msg.type': 'ping',
+							'tldraw.client.last_server_interaction_ms':
+								Date.now() - this.lastServerInteractionTimestamp,
+						}),
+					},
+					() => {
+						try {
+							this.socket.sendMessage(attachTraceCarrier({ type: 'ping' }))
+						} catch (error) {
+							console.warn('ping failed, resetting', error)
+							this.resetConnection()
+						}
+					}
+				)
 			}, PING_INTERVAL),
 			// Check the server connection health, reset the connection if needed
 			interval(() => {
@@ -664,8 +687,20 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 					return
 				}
 
-				console.warn(`Haven't heard from the server in a while, resetting connection...`)
-				this.resetConnection()
+				withSyncSpan(
+					'tlsync.client.health_check_timeout',
+					{
+						attributes: this.getTelemetryAttributes({
+							'tldraw.client.last_server_interaction_ms': timeSinceLastServerInteraction,
+							'tldraw.client.timeout_ms':
+								MAX_TIME_TO_WAIT_FOR_SERVER_INTERACTION_BEFORE_RESETTING_CONNECTION,
+						}),
+					},
+					() => {
+						console.warn(`Haven't heard from the server in a while, resetting connection...`)
+						this.resetConnection()
+					}
+				)
 			}, PING_INTERVAL * 2)
 		)
 
@@ -726,26 +761,40 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 
 	/** Switch to offline mode */
 	private resetConnection(hard = false) {
-		this.debug('resetting connection')
-		if (hard) {
-			this.lastServerClock = 0
-		}
-		// kill all presence state
-		const keys = Object.keys(this.store.serialize('presence')) as any
-		if (keys.length > 0) {
-			this.store.mergeRemoteChanges(() => {
-				this.store.remove(keys)
-			})
-		}
-		this.lastPushedPresenceState = null
-		this.isConnectedToRoom = false
-		this.pendingPushRequests = []
-		this.incomingDiffBuffer = []
-		this.unsentChanges.nextDiff = undefined
-		this.unsentChanges.nextPresence = undefined
-		if (this.socket.connectionStatus === 'online') {
-			this.socket.restart()
-		}
+		withSyncSpan(
+			'tlsync.client.reset_connection',
+			{
+				attributes: this.getTelemetryAttributes({
+					'tldraw.client.reset.hard': hard,
+					'tldraw.client.pending_pushes': this.pendingPushRequests.length,
+					'tldraw.client.pending_incoming_diffs': this.incomingDiffBuffer.length,
+					'tldraw.client.has_unsent_diff': !!this.unsentChanges.nextDiff,
+					'tldraw.client.has_unsent_presence': !!this.unsentChanges.nextPresence,
+				}),
+			},
+			() => {
+				this.debug('resetting connection')
+				if (hard) {
+					this.lastServerClock = 0
+				}
+				// kill all presence state
+				const keys = Object.keys(this.store.serialize('presence')) as any
+				if (keys.length > 0) {
+					this.store.mergeRemoteChanges(() => {
+						this.store.remove(keys)
+					})
+				}
+				this.lastPushedPresenceState = null
+				this.isConnectedToRoom = false
+				this.pendingPushRequests = []
+				this.incomingDiffBuffer = []
+				this.unsentChanges.nextDiff = undefined
+				this.unsentChanges.nextPresence = undefined
+				if (this.socket.connectionStatus === 'online') {
+					this.socket.restart()
+				}
+			}
+		)
 	}
 
 	/**
@@ -754,81 +803,94 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 	 * any local changes that were made while offline.
 	 */
 	private didReconnect(event: Extract<TLSocketServerSentEvent<R>, { type: 'connect' }>) {
-		this.debug('did reconnect', event)
-		if (event.connectRequestId !== this.latestConnectRequestId) {
-			// ignore connect events for old connect requests
-			return
-		}
-		this.latestConnectRequestId = null
-
-		if (this.isConnectedToRoom) {
-			console.error('didReconnect called while already connected')
-			this.resetConnection(true)
-			return
-		}
-		if (this.pendingPushRequests.length > 0) {
-			console.error('pendingPushRequests should already be empty when we reconnect')
-			this.resetConnection(true)
-			return
-		}
-		// at the end of this process we want to have at most one pending push request
-		// based on anything inside this.speculativeChanges
-		transact(() => {
-			// Now our goal is to rebase on the server's state.
-			// This means wiping away any peer presence data, which the server will replace in full on every connect.
-			// If the server does not have enough history to give us a partial document state hydration we will
-			// also need to wipe away all of our document state before hydrating with the server's state from scratch.
-			const stashedChanges = this.speculativeChanges
-			this.speculativeChanges = { added: {} as any, updated: {} as any, removed: {} as any }
-
-			this.store.mergeRemoteChanges(() => {
-				// gather records to delete in a NetworkDiff
-				const wipeDiff: NetworkDiff<R> = {}
-				const wipeAll = event.hydrationType === 'wipe_all'
-				if (!wipeAll) {
-					// if we're only wiping presence data, undo the speculative changes first
-					this.store.applyDiff(reverseRecordsDiff(stashedChanges), { runCallbacks: false })
+		withSyncSpan(
+			'tlsync.client.did_reconnect',
+			{
+				attributes: this.getTelemetryAttributes({
+					'tldraw.msg.type': 'connect',
+					'tldraw.client.last_server_clock': this.lastServerClock,
+					'tldraw.server.clock': event.serverClock,
+					'tldraw.client.hydration_type': event.hydrationType,
+				}),
+			},
+			() => {
+				this.debug('did reconnect', event)
+				if (event.connectRequestId !== this.latestConnectRequestId) {
+					// ignore connect events for old connect requests
+					return
 				}
+				this.latestConnectRequestId = null
 
-				// now wipe all presence data and, if needed, all document data
-				for (const [id, record] of objectMapEntries(this.store.serialize('all'))) {
-					if (
-						(wipeAll && this.store.scopedTypes.document.has(record.typeName)) ||
-						record.typeName === this.presenceType
-					) {
-						wipeDiff[id] = [RecordOpType.Remove]
+				if (this.isConnectedToRoom) {
+					console.error('didReconnect called while already connected')
+					this.resetConnection(true)
+					return
+				}
+				if (this.pendingPushRequests.length > 0) {
+					console.error('pendingPushRequests should already be empty when we reconnect')
+					this.resetConnection(true)
+					return
+				}
+				// at the end of this process we want to have at most one pending push request
+				// based on anything inside this.speculativeChanges
+				transact(() => {
+					// Now our goal is to rebase on the server's state.
+					// This means wiping away any peer presence data, which the server will replace in full on every connect.
+					// If the server does not have enough history to give us a partial document state hydration we will
+					// also need to wipe away all of our document state before hydrating with the server's state from scratch.
+					const stashedChanges = this.speculativeChanges
+					this.speculativeChanges = { added: {} as any, updated: {} as any, removed: {} as any }
+
+					this.store.mergeRemoteChanges(() => {
+						// gather records to delete in a NetworkDiff
+						const wipeDiff: NetworkDiff<R> = {}
+						const wipeAll = event.hydrationType === 'wipe_all'
+						if (!wipeAll) {
+							// if we're only wiping presence data, undo the speculative changes first
+							this.store.applyDiff(reverseRecordsDiff(stashedChanges), { runCallbacks: false })
+						}
+
+						// now wipe all presence data and, if needed, all document data
+						for (const [id, record] of objectMapEntries(this.store.serialize('all'))) {
+							if (
+								(wipeAll && this.store.scopedTypes.document.has(record.typeName)) ||
+								record.typeName === this.presenceType
+							) {
+								wipeDiff[id] = [RecordOpType.Remove]
+							}
+						}
+
+						// then apply the upstream changes
+						this.applyNetworkDiff({ ...wipeDiff, ...event.diff }, true)
+
+						this.isConnectedToRoom = true
+
+						// now re-apply the speculative changes creating a new push request with the
+						// appropriate diff
+						const networkDiff = getNetworkDiff(stashedChanges)
+						if (!networkDiff) return
+						const speculativeChanges = this.store.filterChangesByScope(
+							this.store.extractingChanges(() => {
+								this.applyNetworkDiff(networkDiff, true)
+							}),
+							'document'
+						)
+						if (speculativeChanges) this.push(speculativeChanges)
+					})
+
+					// this.isConnectedToRoom = true
+					// this.store.applyDiff(stashedChanges, false)
+
+					this.onAfterConnect?.(this, { isReadonly: event.isReadonly })
+					const presence = this.presenceState?.get()
+					if (presence) {
+						this.pushPresence(presence)
 					}
-				}
+				})
 
-				// then apply the upstream changes
-				this.applyNetworkDiff({ ...wipeDiff, ...event.diff }, true)
-
-				this.isConnectedToRoom = true
-
-				// now re-apply the speculative changes creating a new push request with the
-				// appropriate diff
-				const networkDiff = getNetworkDiff(stashedChanges)
-				if (!networkDiff) return
-				const speculativeChanges = this.store.filterChangesByScope(
-					this.store.extractingChanges(() => {
-						this.applyNetworkDiff(networkDiff, true)
-					}),
-					'document'
-				)
-				if (speculativeChanges) this.push(speculativeChanges)
-			})
-
-			// this.isConnectedToRoom = true
-			// this.store.applyDiff(stashedChanges, false)
-
-			this.onAfterConnect?.(this, { isReadonly: event.isReadonly })
-			const presence = this.presenceState?.get()
-			if (presence) {
-				this.pushPresence(presence)
+				this.lastServerClock = event.serverClock
 			}
-		})
-
-		this.lastServerClock = event.serverClock
+		)
 	}
 
 	private incomingDiffBuffer: TLSocketServerSentDataEvent<R>[] = []
@@ -906,30 +968,52 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 	private lastPushedPresenceState: R | null = null
 
 	private pushPresence(nextPresence: R | null) {
-		// make sure we push any document changes first
-		this.store._flushHistory()
+		withSyncSpan(
+			'tlsync.client.push_presence',
+			{
+				attributes: this.getTelemetryAttributes({
+					'tldraw.has_presence': !!nextPresence,
+					'tldraw.client.is_connected': this.isConnectedToRoom,
+				}),
+			},
+			() => {
+				// make sure we push any document changes first
+				this.store._flushHistory()
 
-		if (!this.isConnectedToRoom) {
-			// if we're offline, don't do anything
-			return
-		}
+				if (!this.isConnectedToRoom) {
+					// if we're offline, don't do anything
+					return
+				}
 
-		this.unsentChanges.nextPresence = nextPresence
-		this.sendUnsentChanges()
+				this.unsentChanges.nextPresence = nextPresence
+				this.sendUnsentChanges()
+			}
+		)
 	}
 
 	/** Push a change to the server, or stash it locally if we're offline */
 	private push(change: RecordsDiff<any>) {
-		this.debug('push', change)
-		squashRecordDiffsMutable(this.speculativeChanges, [change])
-		// in offline mode, we only accumulate in speculativeChanges
-		if (!this.isConnectedToRoom) return
-		if (!this.unsentChanges.nextDiff) {
-			this.unsentChanges.nextDiff = structuredClone(change)
-		} else {
-			squashRecordDiffsMutable(this.unsentChanges.nextDiff, [change])
-		}
-		this.sendUnsentChanges()
+		withSyncSpan(
+			'tlsync.client.queue_push',
+			{
+				attributes: this.getTelemetryAttributes({
+					'tldraw.client.is_connected': this.isConnectedToRoom,
+					...summarizeRecordDiff(change as RecordsDiff<UnknownRecord>),
+				}),
+			},
+			() => {
+				this.debug('push', change)
+				squashRecordDiffsMutable(this.speculativeChanges, [change])
+				// in offline mode, we only accumulate in speculativeChanges
+				if (!this.isConnectedToRoom) return
+				if (!this.unsentChanges.nextDiff) {
+					this.unsentChanges.nextDiff = structuredClone(change)
+				} else {
+					squashRecordDiffsMutable(this.unsentChanges.nextDiff, [change])
+				}
+				this.sendUnsentChanges()
+			}
+		)
 	}
 
 	/** Get the target FPS for network operations based on presence mode */
@@ -980,70 +1064,82 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 
 	// eslint-disable-next-line local/prefer-class-methods
 	private rebase = () => {
-		// need to make sure that our speculative changes are in sync with the actual store instance before
-		// proceeding, to avoid inconsistency bugs.
-		this.store._flushHistory()
-		if (this.incomingDiffBuffer.length === 0) return
+		withSyncSpan(
+			'tlsync.client.rebase',
+			{
+				attributes: this.getTelemetryAttributes({
+					'tldraw.client.pending_incoming_diffs': this.incomingDiffBuffer.length,
+					'tldraw.client.pending_pushes': this.pendingPushRequests.length,
+					'tldraw.client.has_unsent_diff': !!this.unsentChanges.nextDiff,
+				}),
+			},
+			() => {
+				// need to make sure that our speculative changes are in sync with the actual store instance before
+				// proceeding, to avoid inconsistency bugs.
+				this.store._flushHistory()
+				if (this.incomingDiffBuffer.length === 0) return
 
-		const diffs = this.incomingDiffBuffer
-		this.incomingDiffBuffer = []
+				const diffs = this.incomingDiffBuffer
+				this.incomingDiffBuffer = []
 
-		try {
-			this.store.mergeRemoteChanges(() => {
-				// first undo speculative changes
-				this.store.applyDiff(reverseRecordsDiff(this.speculativeChanges), { runCallbacks: false })
-
-				// then apply network diffs on top of known-to-be-synced data
-				for (const diff of diffs) {
-					if (diff.type === 'patch') {
-						this.applyNetworkDiff(diff.diff, true)
-						continue
-					}
-					// handling push_result
-					if (this.pendingPushRequests.length === 0) {
-						throw new Error('Received push_result but there are no pending push requests')
-					}
-					if (this.pendingPushRequests[0].clientClock !== diff.clientClock) {
-						throw new Error(
-							'Received push_result for a push request that is not at the front of the queue'
-						)
-					}
-					if (diff.action === 'discard') {
-						this.pendingPushRequests.shift()
-					} else if (diff.action === 'commit') {
-						const request = this.pendingPushRequests.shift()!
-						if ('diff' in request && request.diff) {
-							this.applyNetworkDiff(request.diff, true)
-						}
-					} else {
-						this.applyNetworkDiff(diff.action.rebaseWithDiff, true)
-						this.pendingPushRequests.shift()
-					}
-				}
-				// update the speculative diff while re-applying pending changes
 				try {
-					this.speculativeChanges = this.store.extractingChanges(() => {
-						for (const request of this.pendingPushRequests) {
-							if (!('diff' in request) || !request.diff) continue
-							this.applyNetworkDiff(request.diff, true)
+					this.store.mergeRemoteChanges(() => {
+						// first undo speculative changes
+						this.store.applyDiff(reverseRecordsDiff(this.speculativeChanges), { runCallbacks: false })
+
+						// then apply network diffs on top of known-to-be-synced data
+						for (const diff of diffs) {
+							if (diff.type === 'patch') {
+								this.applyNetworkDiff(diff.diff, true)
+								continue
+							}
+							// handling push_result
+							if (this.pendingPushRequests.length === 0) {
+								throw new Error('Received push_result but there are no pending push requests')
+							}
+							if (this.pendingPushRequests[0].clientClock !== diff.clientClock) {
+								throw new Error(
+									'Received push_result for a push request that is not at the front of the queue'
+								)
+							}
+							if (diff.action === 'discard') {
+								this.pendingPushRequests.shift()
+							} else if (diff.action === 'commit') {
+								const request = this.pendingPushRequests.shift()!
+								if ('diff' in request && request.diff) {
+									this.applyNetworkDiff(request.diff, true)
+								}
+							} else {
+								this.applyNetworkDiff(diff.action.rebaseWithDiff, true)
+								this.pendingPushRequests.shift()
+							}
 						}
-						if (!this.unsentChanges.nextDiff) return
-						const diff = getNetworkDiff(this.unsentChanges.nextDiff)
-						if (!diff) return
-						this.applyNetworkDiff(diff, true)
+						// update the speculative diff while re-applying pending changes
+						try {
+							this.speculativeChanges = this.store.extractingChanges(() => {
+								for (const request of this.pendingPushRequests) {
+									if (!('diff' in request) || !request.diff) continue
+									this.applyNetworkDiff(request.diff, true)
+								}
+								if (!this.unsentChanges.nextDiff) return
+								const diff = getNetworkDiff(this.unsentChanges.nextDiff)
+								if (!diff) return
+								this.applyNetworkDiff(diff, true)
+							})
+						} catch (e) {
+							console.error(e)
+							// throw away the speculative changes and start over
+							this.speculativeChanges = { added: {} as any, updated: {} as any, removed: {} as any }
+							this.resetConnection()
+						}
 					})
+					this.lastServerClock = diffs.at(-1)?.serverClock ?? this.lastServerClock
 				} catch (e) {
 					console.error(e)
-					// throw away the speculative changes and start over
-					this.speculativeChanges = { added: {} as any, updated: {} as any, removed: {} as any }
+					this.store.ensureStoreIsUsable()
 					this.resetConnection()
 				}
-			})
-			this.lastServerClock = diffs.at(-1)?.serverClock ?? this.lastServerClock
-		} catch (e) {
-			console.error(e)
-			this.store.ensureStoreIsUsable()
-			this.resetConnection()
-		}
+			}
+		)
 	}
 }

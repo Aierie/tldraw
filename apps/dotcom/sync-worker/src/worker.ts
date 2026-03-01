@@ -228,9 +228,9 @@ export default class Worker extends WorkerEntrypoint<Environment> {
 					'http.path': new URL(request.url).pathname,
 				},
 			},
-			async () => {
+			async (span) => {
 				try {
-					return await handleApiRequest({
+					const response = await handleApiRequest({
 						router,
 						request,
 						env: this.env,
@@ -267,6 +267,8 @@ export default class Worker extends WorkerEntrypoint<Environment> {
 						}
 						throw err
 					})
+					span.setAttribute('http.status_code', response.status)
+					return response
 				} finally {
 					this.ctx.waitUntil(flushOtel())
 				}

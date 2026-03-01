@@ -111,12 +111,14 @@ export class ClientWebSocketAdapter
 	}
 
 	private _handleConnect() {
-		debug('handleConnect')
+		withSyncSpan('tlsync.socket.client.connected', {}, () => {
+			debug('handleConnect')
 
-		this._connectionStatus.set('online')
-		this.statusListeners.forEach((cb) => cb({ status: 'online' }))
+			this._connectionStatus.set('online')
+			this.statusListeners.forEach((cb) => cb({ status: 'online' }))
 
-		this._reconnectManager.connected()
+			this._reconnectManager.connected()
+		})
 	}
 
 	private _handleDisconnect(
@@ -125,47 +127,66 @@ export class ClientWebSocketAdapter
 		didOpen?: boolean,
 		closeReason?: string
 	) {
-		closeReason = closeReason || TLSyncErrorCloseEventReason.UNKNOWN_ERROR
+		withSyncSpan(
+			'tlsync.socket.client.disconnected',
+			{
+				attributes: {
+					'tldraw.socket.disconnect.reason': reason,
+					'tldraw.socket.close_code': closeCode ?? -1,
+					'tldraw.socket.did_open': !!didOpen,
+					'tldraw.socket.status_before': this.connectionStatus,
+				},
+			},
+			(span) => {
+				const resolvedCloseReason = closeReason || TLSyncErrorCloseEventReason.UNKNOWN_ERROR
+				span.setAttribute('tldraw.socket.close_reason', resolvedCloseReason)
 
-		debug('handleDisconnect', {
-			currentStatus: this.connectionStatus,
-			closeCode,
-			reason,
-		})
+				debug('handleDisconnect', {
+					currentStatus: this.connectionStatus,
+					closeCode,
+					reason,
+				})
 
-		let newStatus: 'offline' | 'error'
-		switch (reason) {
-			case 'closed':
-				if (closeCode === TLSyncErrorCloseEventCode) {
-					newStatus = 'error'
-				} else {
-					newStatus = 'offline'
+				let newStatus: 'offline' | 'error'
+				switch (reason) {
+					case 'closed':
+						if (closeCode === TLSyncErrorCloseEventCode) {
+							newStatus = 'error'
+						} else {
+							newStatus = 'offline'
+						}
+						break
+					case 'manual':
+						newStatus = 'offline'
+						break
 				}
-				break
-			case 'manual':
-				newStatus = 'offline'
-				break
-		}
+				span.setAttribute('tldraw.socket.status_after', newStatus)
 
-		if (closeCode === 1006 && !didOpen) {
-			warnOnce(
-				"Could not open WebSocket connection. This might be because you're trying to load a URL that doesn't support websockets. Check the URL you're trying to connect to."
-			)
-		}
+				if (closeCode === 1006 && !didOpen) {
+					warnOnce(
+						"Could not open WebSocket connection. This might be because you're trying to load a URL that doesn't support websockets. Check the URL you're trying to connect to."
+					)
+				}
 
-		if (
-			// it the status changed
-			this.connectionStatus !== newStatus &&
-			// ignore errors if we're already in the offline state
-			!(newStatus === 'error' && this.connectionStatus === 'offline')
-		) {
-			this._connectionStatus.set(newStatus)
-			this.statusListeners.forEach((cb) =>
-				cb(newStatus === 'error' ? { status: 'error', reason: closeReason } : { status: newStatus })
-			)
-		}
+				if (
+					// it the status changed
+					this.connectionStatus !== newStatus &&
+					// ignore errors if we're already in the offline state
+					!(newStatus === 'error' && this.connectionStatus === 'offline')
+				) {
+					this._connectionStatus.set(newStatus)
+					this.statusListeners.forEach((cb) =>
+						cb(
+							newStatus === 'error'
+								? { status: 'error', reason: resolvedCloseReason }
+								: { status: newStatus }
+						)
+					)
+				}
 
-		this._reconnectManager.disconnected()
+				this._reconnectManager.disconnected()
+			}
+		)
 	}
 
 	_setNewSocket(ws: WebSocket) {
@@ -184,36 +205,60 @@ export class ClientWebSocketAdapter
 		//       timeout, but in either case those sockets don't need any special handling, the browser
 		//       will close them eventually. We just "orphan" such sockets and ignore their onclose/onerror.
 		ws.onopen = () => {
-			debug('ws.onopen')
-			assert(
-				this._ws === ws,
-				"sockets must only be orphaned when they are CLOSING or CLOSED, so they can't open"
-			)
-			didOpen = true
-			this._handleConnect()
+			withSyncSpan('tlsync.socket.client.onopen', {}, () => {
+				debug('ws.onopen')
+				assert(
+					this._ws === ws,
+					"sockets must only be orphaned when they are CLOSING or CLOSED, so they can't open"
+				)
+				didOpen = true
+				this._handleConnect()
+			})
 		}
 		ws.onclose = (event: CloseEvent) => {
-			debug('ws.onclose', event)
-			if (this._ws === ws) {
-				this._handleDisconnect('closed', event.code, didOpen, event.reason)
-			} else {
-				debug('ignoring onclose for an orphaned socket')
-			}
+			withSyncSpan(
+				'tlsync.socket.client.onclose',
+				{
+					attributes: {
+						'tldraw.socket.close_code': event.code,
+						'tldraw.socket.close_reason': event.reason,
+						'tldraw.socket.did_open': didOpen,
+					},
+				},
+				() => {
+					debug('ws.onclose', event)
+					if (this._ws === ws) {
+						this._handleDisconnect('closed', event.code, didOpen, event.reason)
+					} else {
+						debug('ignoring onclose for an orphaned socket')
+					}
+				}
+			)
 		}
 		ws.onerror = (event) => {
-			debug('ws.onerror', event)
-			if (this._ws === ws) {
-				this._handleDisconnect('closed')
-			} else {
-				debug('ignoring onerror for an orphaned socket')
-			}
+			withSyncSpan('tlsync.socket.client.onerror', {}, () => {
+				debug('ws.onerror', event)
+				if (this._ws === ws) {
+					this._handleDisconnect('closed')
+				} else {
+					debug('ignoring onerror for an orphaned socket')
+				}
+			})
 		}
 		ws.onmessage = (ev) => {
 			assert(
 				this._ws === ws,
 				"sockets must only be orphaned when they are CLOSING or CLOSED, so they can't receive messages"
 			)
-			const parsed = JSON.parse(ev.data.toString())
+			const parsed = withSyncSpan(
+				'tlsync.socket.client.parse_message',
+				{
+					attributes: {
+						'tldraw.msg.bytes': String(ev.data).length,
+					},
+				},
+				() => JSON.parse(ev.data.toString())
+			)
 			const parentContext = extractTraceContext(parsed?.trace)
 			withSyncSpan(
 				'tlsync.socket.client.receive',
@@ -224,7 +269,18 @@ export class ClientWebSocketAdapter
 					},
 				},
 				() => {
-					this.messageListeners.forEach((cb) => cb(parsed))
+					withSyncSpan(
+						'tlsync.socket.client.dispatch_message',
+						{
+							attributes: {
+								'tldraw.msg.type': parsed?.type ?? 'unknown',
+								'tldraw.msg.listeners': this.messageListeners.size,
+							},
+						},
+						() => {
+							this.messageListeners.forEach((cb) => cb(parsed))
+						}
+					)
 				},
 				parentContext
 			)
@@ -277,7 +333,19 @@ export class ClientWebSocketAdapter
 	sendMessage(msg: TLSocketClientSentEvent<TLRecord>) {
 		assert(!this.isDisposed, 'Tried to send message on a disposed socket')
 
-		if (!this._ws) return
+		if (!this._ws) {
+			withSyncSpan(
+				'tlsync.socket.client.send_dropped',
+				{
+					attributes: {
+						'tldraw.msg.type': msg.type,
+						'tldraw.socket.drop_reason': 'no_socket',
+					},
+				},
+				() => {}
+			)
+			return
+		}
 		if (this.connectionStatus === 'online') {
 			withSyncSpan(
 				'tlsync.socket.client.send',
@@ -298,6 +366,17 @@ export class ClientWebSocketAdapter
 				}
 			)
 		} else {
+			withSyncSpan(
+				'tlsync.socket.client.send_dropped',
+				{
+					attributes: {
+						'tldraw.msg.type': msg.type,
+						'tldraw.socket.drop_reason': 'not_online',
+						'tldraw.socket.status': this.connectionStatus,
+					},
+				},
+				() => {}
+			)
 			console.warn('Tried to send message while ' + this.connectionStatus)
 		}
 	}
@@ -530,20 +609,31 @@ export class ReconnectManager {
 	}
 
 	private scheduleAttempt() {
-		assert(this.state === 'pendingAttempt')
-		debug('scheduling a connection attempt')
-		Promise.resolve(this.getUri()).then((uri) => {
-			// this can happen if the promise gets resolved too late
-			if (this.state !== 'pendingAttempt' || this.isDisposed) return
-			assert(
-				this.socketAdapter._ws?.readyState !== WebSocket.OPEN,
-				'There should be no connection attempts while already connected'
-			)
+		withSyncSpan(
+			'tlsync.socket.client.reconnect.schedule_attempt',
+			{
+				attributes: {
+					'tldraw.socket.reconnect.state': this.state,
+					'tldraw.socket.reconnect.intended_delay_ms': this.intendedDelay,
+				},
+			},
+			() => {
+				assert(this.state === 'pendingAttempt')
+				debug('scheduling a connection attempt')
+				Promise.resolve(this.getUri()).then((uri) => {
+					// this can happen if the promise gets resolved too late
+					if (this.state !== 'pendingAttempt' || this.isDisposed) return
+					assert(
+						this.socketAdapter._ws?.readyState !== WebSocket.OPEN,
+						'There should be no connection attempts while already connected'
+					)
 
-			this.lastAttemptStart = Date.now()
-			this.socketAdapter._setNewSocket(new WebSocket(httpToWs(uri)))
-			this.state = 'pendingAttemptResult'
-		})
+					this.lastAttemptStart = Date.now()
+					this.socketAdapter._setNewSocket(new WebSocket(httpToWs(uri)))
+					this.state = 'pendingAttemptResult'
+				})
+			}
+		)
 	}
 
 	private getMaxDelay() {
@@ -585,56 +675,67 @@ export class ReconnectManager {
 	 * ```
 	 */
 	maybeReconnected() {
-		debug('ReconnectManager.maybeReconnected')
-		// It doesn't make sense to have another check scheduled if we're already checking it now.
-		// If we have a CONNECTING check scheduled and relevant, it'll be recreated below anyway
-		this.clearRecheckConnectingTimeout()
-
-		// readyState can be CONNECTING, OPEN, CLOSING, CLOSED, or null (if getUri() is still pending)
-		if (this.socketAdapter._ws?.readyState === WebSocket.OPEN) {
-			debug('ReconnectManager.maybeReconnected: already connected')
-			// nothing to do, we're already OK
-			return
-		}
-
-		if (this.socketAdapter._ws?.readyState === WebSocket.CONNECTING) {
-			debug('ReconnectManager.maybeReconnected: connecting')
-			// We might be waiting for a TCP connection that sent SYN out and will never get it back,
-			// while a new connection appeared. On the other hand, we might have just started connecting
-			// and will succeed in a bit. Thus, we're checking how old the attempt is and retry anew
-			// if it's old enough. This by itself can delay the connection a bit, but shouldn't prevent
-			// new connections as long as `maybeReconnected` is not looped itself
-			assert(
-				this.lastAttemptStart,
-				'ReadyState=CONNECTING without lastAttemptStart should be impossible'
-			)
-			const sinceLastStart = Date.now() - this.lastAttemptStart
-			if (sinceLastStart < ATTEMPT_TIMEOUT) {
-				debug('ReconnectManager.maybeReconnected: connecting, rechecking later')
-				this.recheckConnectingTimeout = setTimeout(
-					() => this.maybeReconnected(),
-					ATTEMPT_TIMEOUT - sinceLastStart
-				)
-			} else {
-				debug('ReconnectManager.maybeReconnected: connecting, but for too long, retry now')
-				// Last connection attempt was started a while ago, it's possible that network conditions
-				// changed, and it's worth retrying to connect. `disconnected` will handle reconnection
-				//
-				// NOTE: The danger here is looping in connection attemps if connections are slow.
-				//       Make sure that `maybeReconnected` is not called in the `disconnected` codepath!
+		withSyncSpan(
+			'tlsync.socket.client.reconnect.maybe_reconnected',
+			{
+				attributes: {
+					'tldraw.socket.reconnect.state': this.state,
+					'tldraw.socket.reconnect.intended_delay_ms': this.intendedDelay,
+					'tldraw.socket.ready_state': this.socketAdapter._ws?.readyState ?? -1,
+				},
+			},
+			() => {
+				debug('ReconnectManager.maybeReconnected')
+				// It doesn't make sense to have another check scheduled if we're already checking it now.
+				// If we have a CONNECTING check scheduled and relevant, it'll be recreated below anyway
 				this.clearRecheckConnectingTimeout()
-				this.socketAdapter._closeSocket()
+
+				// readyState can be CONNECTING, OPEN, CLOSING, CLOSED, or null (if getUri() is still pending)
+				if (this.socketAdapter._ws?.readyState === WebSocket.OPEN) {
+					debug('ReconnectManager.maybeReconnected: already connected')
+					// nothing to do, we're already OK
+					return
+				}
+
+				if (this.socketAdapter._ws?.readyState === WebSocket.CONNECTING) {
+					debug('ReconnectManager.maybeReconnected: connecting')
+					// We might be waiting for a TCP connection that sent SYN out and will never get it back,
+					// while a new connection appeared. On the other hand, we might have just started connecting
+					// and will succeed in a bit. Thus, we're checking how old the attempt is and retry anew
+					// if it's old enough. This by itself can delay the connection a bit, but shouldn't prevent
+					// new connections as long as `maybeReconnected` is not looped itself
+					if (this.lastAttemptStart === null) {
+						this.lastAttemptStart = Date.now()
+					}
+					const sinceLastStart = Date.now() - this.lastAttemptStart
+					if (sinceLastStart < ATTEMPT_TIMEOUT) {
+						debug('ReconnectManager.maybeReconnected: connecting, rechecking later')
+						this.recheckConnectingTimeout = setTimeout(
+							() => this.maybeReconnected(),
+							ATTEMPT_TIMEOUT - sinceLastStart
+						)
+					} else {
+						debug('ReconnectManager.maybeReconnected: connecting, but for too long, retry now')
+						// Last connection attempt was started a while ago, it's possible that network conditions
+						// changed, and it's worth retrying to connect. `disconnected` will handle reconnection
+						//
+						// NOTE: The danger here is looping in connection attemps if connections are slow.
+						//       Make sure that `maybeReconnected` is not called in the `disconnected` codepath!
+						this.clearRecheckConnectingTimeout()
+						this.socketAdapter._closeSocket()
+					}
+
+					return
+				}
+
+				debug('ReconnectManager.maybeReconnected: closing/closed/null, retry now')
+				// readyState is CLOSING or CLOSED, or the websocket is null
+				// Restart the backoff and retry ASAP (honouring the min delay)
+				// this.state doesn't really matter, because disconnected() will handle any state correctly
+				this.intendedDelay = ACTIVE_MIN_DELAY
+				this.disconnected()
 			}
-
-			return
-		}
-
-		debug('ReconnectManager.maybeReconnected: closing/closed/null, retry now')
-		// readyState is CLOSING or CLOSED, or the websocket is null
-		// Restart the backoff and retry ASAP (honouring the min delay)
-		// this.state doesn't really matter, because disconnected() will handle any state correctly
-		this.intendedDelay = ACTIVE_MIN_DELAY
-		this.disconnected()
+		)
 	}
 
 	/**
@@ -654,52 +755,64 @@ export class ReconnectManager {
 	 * ```
 	 */
 	disconnected() {
-		debug('ReconnectManager.disconnected')
-		// This either means we're freshly disconnected, or the last connection attempt failed;
-		// either way, time to try again.
+		withSyncSpan(
+			'tlsync.socket.client.reconnect.disconnected',
+			{
+				attributes: {
+					'tldraw.socket.reconnect.state': this.state,
+					'tldraw.socket.reconnect.intended_delay_ms': this.intendedDelay,
+					'tldraw.socket.ready_state': this.socketAdapter._ws?.readyState ?? -1,
+				},
+			},
+			() => {
+				debug('ReconnectManager.disconnected')
+				// This either means we're freshly disconnected, or the last connection attempt failed;
+				// either way, time to try again.
 
-		// Guard against delayed notifications and recheck synchronously
-		if (
-			this.socketAdapter._ws?.readyState !== WebSocket.OPEN &&
-			this.socketAdapter._ws?.readyState !== WebSocket.CONNECTING
-		) {
-			debug('ReconnectManager.disconnected: websocket is not OPEN or CONNECTING')
-			this.clearReconnectTimeout()
+				// Guard against delayed notifications and recheck synchronously
+				if (
+					this.socketAdapter._ws?.readyState !== WebSocket.OPEN &&
+					this.socketAdapter._ws?.readyState !== WebSocket.CONNECTING
+				) {
+					debug('ReconnectManager.disconnected: websocket is not OPEN or CONNECTING')
+					this.clearReconnectTimeout()
 
-			let delayLeft
-			if (this.state === 'connected') {
-				// it's the first sign that we got disconnected; the state will be updated below,
-				// just set the appropriate delay for now
-				this.intendedDelay = this.getMinDelay()
-				delayLeft = this.intendedDelay
-			} else {
-				delayLeft =
-					this.lastAttemptStart !== null
-						? this.lastAttemptStart + this.intendedDelay - Date.now()
-						: 0
+					let delayLeft
+					if (this.state === 'connected') {
+						// it's the first sign that we got disconnected; the state will be updated below,
+						// just set the appropriate delay for now
+						this.intendedDelay = this.getMinDelay()
+						delayLeft = this.intendedDelay
+					} else {
+						delayLeft =
+							this.lastAttemptStart !== null
+								? this.lastAttemptStart + this.intendedDelay - Date.now()
+								: 0
+					}
+
+					if (delayLeft > 0) {
+						debug('ReconnectManager.disconnected: delaying, delayLeft', delayLeft)
+						// try again later
+						this.state = 'delay'
+
+						this.reconnectTimeout = setTimeout(() => this.disconnected(), delayLeft)
+					} else {
+						// not connected and not delayed, time to retry
+						this.state = 'pendingAttempt'
+
+						this.intendedDelay = Math.min(
+							this.getMaxDelay(),
+							Math.max(this.getMinDelay(), this.intendedDelay) * DELAY_EXPONENT
+						)
+						debug(
+							'ReconnectManager.disconnected: attempting a connection, next delay',
+							this.intendedDelay
+						)
+						this.scheduleAttempt()
+					}
+				}
 			}
-
-			if (delayLeft > 0) {
-				debug('ReconnectManager.disconnected: delaying, delayLeft', delayLeft)
-				// try again later
-				this.state = 'delay'
-
-				this.reconnectTimeout = setTimeout(() => this.disconnected(), delayLeft)
-			} else {
-				// not connected and not delayed, time to retry
-				this.state = 'pendingAttempt'
-
-				this.intendedDelay = Math.min(
-					this.getMaxDelay(),
-					Math.max(this.getMinDelay(), this.intendedDelay) * DELAY_EXPONENT
-				)
-				debug(
-					'ReconnectManager.disconnected: attempting a connection, next delay',
-					this.intendedDelay
-				)
-				this.scheduleAttempt()
-			}
-		}
+		)
 	}
 
 	/**
@@ -716,14 +829,25 @@ export class ReconnectManager {
 	 * ```
 	 */
 	connected() {
-		debug('ReconnectManager.connected')
-		// this notification could've been delayed, recheck synchronously
-		if (this.socketAdapter._ws?.readyState === WebSocket.OPEN) {
-			debug('ReconnectManager.connected: websocket is OPEN')
-			this.state = 'connected'
-			this.clearReconnectTimeout()
-			this.intendedDelay = ACTIVE_MIN_DELAY
-		}
+		withSyncSpan(
+			'tlsync.socket.client.reconnect.connected',
+			{
+				attributes: {
+					'tldraw.socket.reconnect.state': this.state,
+					'tldraw.socket.ready_state': this.socketAdapter._ws?.readyState ?? -1,
+				},
+			},
+			() => {
+				debug('ReconnectManager.connected')
+				// this notification could've been delayed, recheck synchronously
+				if (this.socketAdapter._ws?.readyState === WebSocket.OPEN) {
+					debug('ReconnectManager.connected: websocket is OPEN')
+					this.state = 'connected'
+					this.clearReconnectTimeout()
+					this.intendedDelay = ACTIVE_MIN_DELAY
+				}
+			}
+		)
 	}
 
 	/**
