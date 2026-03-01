@@ -15,7 +15,7 @@ import {
 import { IndexKey, ZERO_INDEX_KEY } from '@tldraw/utils'
 import { MAX_TOMBSTONES, TOMBSTONE_PRUNE_BUFFER_SIZE } from '../lib/InMemorySyncStorage'
 import { NodeSqliteWrapper } from '../lib/NodeSqliteWrapper'
-import { SQLiteSyncStorage } from '../lib/SQLiteSyncStorage'
+import { migrateSqliteSyncStorage, SQLiteSyncStorage } from '../lib/SQLiteSyncStorage'
 import { RoomSnapshot } from '../lib/TLSyncRoom'
 
 type DatabaseSync = {
@@ -75,6 +75,66 @@ function getStorage(snapshot: RoomSnapshot, wrapperConfig?: { tablePrefix?: stri
 	const sql = createWrapper(wrapperConfig)
 	return new SQLiteSyncStorage<TLRecord>({ sql, snapshot })
 }
+
+describe('SQLiteSyncStorage migrations (wrapper-level)', () => {
+	function createMigrationMock({
+		migrationVersion,
+		throwOnRead = false,
+	}: {
+		migrationVersion?: number
+		throwOnRead?: boolean
+	}) {
+		const execCalls: string[] = []
+		const sql = {
+			prepare(query: string) {
+				return {
+					all() {
+						if (query.includes('SELECT migrationVersion')) {
+							if (throwOnRead) throw new Error('no such table: metadata')
+							if (migrationVersion == null) return []
+							return [{ migrationVersion }]
+						}
+						return []
+					},
+					iterate() {
+						return [][Symbol.iterator]()
+					},
+					run() {
+						// noop for migration SQL tests
+					},
+				}
+			},
+			exec(sql: string) {
+				execCalls.push(sql)
+			},
+			transaction<T>(callback: () => T): T {
+				return callback()
+			},
+		}
+		return { sql, execCalls }
+	}
+
+	it('applies TEXT->BLOB migration SQL for migrationVersion=1', () => {
+		const { sql, execCalls } = createMigrationMock({ migrationVersion: 1 })
+
+		migrateSqliteSyncStorage(sql as any)
+
+		const emitted = execCalls.join('\n')
+		expect(emitted).toContain('CAST(state AS BLOB)')
+		expect(emitted).toContain('UPDATE metadata SET migrationVersion = 2')
+	})
+
+	it('bootstraps fresh schema with BLOB state when metadata is missing', () => {
+		const { sql, execCalls } = createMigrationMock({ throwOnRead: true })
+
+		migrateSqliteSyncStorage(sql as any)
+
+		const emitted = execCalls.join('\n')
+		expect(emitted).toContain('state BLOB NOT NULL')
+		expect(emitted).not.toContain('CAST(state AS BLOB)')
+		expect(emitted).toContain('UPDATE metadata SET migrationVersion = 2')
+	})
+})
 
 describeIfNodeSqlite('SQLiteSyncStorage', () => {
 	describe('Static methods', () => {
