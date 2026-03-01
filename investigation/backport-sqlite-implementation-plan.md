@@ -171,8 +171,10 @@ Prove backport correctness and operational readiness.
 4. Cloudflare config/runtime checks.
 5. Optional claims/runbook scorecard pass for auditability.
 
-**Recommended post-check (non-blocking)**
-- OTel trace parity checks for SQLite span family and connect/push `did_change` semantics.
+**Required feedback loop (non-gating)**
+- Run OTel trace checks for SQLite span family and connect/push `did_change` semantics.
+- Use these traces as implementation feedback and change documentation (confirm code paths are flowing as intended).
+- Do not treat OTel parity as acceptance gating for the backport.
 
 ## 4) Dependency / Prerequisite Graph
 
@@ -251,5 +253,6 @@ Prove backport correctness and operational readiness.
    - Changes are phased in reversible commit boundaries.
    - Cloudflare migration remediation strategy uses forward migrations only.
 
-8. Optional observability post-check recorded:
-   - OTel SQLite span-family and connect/push `did_change` semantics reviewed and documented (recommended, non-blocking).
+8. Observability feedback loop recorded (non-gating):
+   - OTel SQLite span-family and connect/push `did_change` semantics reviewed and documented.
+   - Findings are captured as diagnostic evidence of code-path behavior, not release-blocking acceptance criteria.

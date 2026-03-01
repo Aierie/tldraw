@@ -7,6 +7,12 @@ Define the expected runtime behavior in `tldraw-3` once SQLite storage support i
 2. which flows write SQLite
 3. what OTel traces should prove those behaviors
 
+Interpretation note:
+
+- The OTel trace portions of this document are a required feedback/documentation loop for systemic change work.
+- They are diagnostic and explanatory, not release-blocking acceptance criteria.
+- Functional behavior and test outcomes remain the acceptance gate.
+
 ## Reference baseline
 Use the following reference naming throughout this document:
 
@@ -229,8 +235,8 @@ Direct trace/code comparison between `tldraw-3` and `tldraw@4` implies:
 5. Reconnect observability parity should be restored with the SQLite backport validation pass:
    include explicit reconnect scheduling/connected spans, not only `tlsync.client.did_reconnect`.
 
-## Trace-based acceptance criteria for this branch
-After SQLite backport, traces for the existing sync-worker e2e flows should show:
+## Trace-based feedback checklist (required, non-gating)
+After SQLite backport, traces for the existing sync-worker e2e flows should be reviewed for:
 
 1. Presence of SQLite span family (`exec`, `statement.*`, `transaction`, `transaction.wrapper`) in `internal/observability/otel/data/traces*.jsonl`.
 2. `tlsync.room.push` spans coexisting with SQLite write activity for document-editing tests.
