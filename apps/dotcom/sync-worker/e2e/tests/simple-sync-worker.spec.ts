@@ -583,7 +583,7 @@ test.describe('simple sync worker e2e', () => {
 		const collectorReachable = await isCollectorReachable()
 		expect(
 			collectorReachable,
-			'OTel collector is not reachable at http://127.0.0.1:4318. Start it with /Users/michael/.codex/skills/tldraw-otel-lab/scripts/otel_lab.sh up --fresh.'
+			'OTel collector is not reachable at http://127.0.0.1:4318. Start it with ./skills/tldraw-otel-lab/scripts/otel_lab.sh up --fresh from the repo root.'
 		).toBe(true)
 
 		const roomId = buildRoomId(testInfo)
@@ -714,7 +714,7 @@ test.describe('simple sync worker e2e', () => {
 		const collectorReachable = await isCollectorReachable()
 		expect(
 			collectorReachable,
-			'OTel collector is not reachable at http://127.0.0.1:4318. Start it with /Users/michael/.codex/skills/tldraw-otel-lab/scripts/otel_lab.sh up --fresh.'
+			'OTel collector is not reachable at http://127.0.0.1:4318. Start it with ./skills/tldraw-otel-lab/scripts/otel_lab.sh up --fresh from the repo root.'
 		).toBe(true)
 
 		const roomId = buildRoomId(testInfo)
@@ -777,7 +777,7 @@ test.describe('simple sync worker e2e', () => {
 		const collectorReachable = await isCollectorReachable()
 		expect(
 			collectorReachable,
-			'OTel collector is not reachable at http://127.0.0.1:4318. Start it with /Users/michael/.codex/skills/tldraw-otel-lab/scripts/otel_lab.sh up --fresh.'
+			'OTel collector is not reachable at http://127.0.0.1:4318. Start it with ./skills/tldraw-otel-lab/scripts/otel_lab.sh up --fresh from the repo root.'
 		).toBe(true)
 
 		const roomId = buildRoomId(testInfo)

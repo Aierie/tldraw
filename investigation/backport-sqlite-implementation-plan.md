@@ -169,7 +169,7 @@ Prove backport correctness and operational readiness.
 2. SQLite-specific unit + integration tests.
 3. Simple worker e2e.
 4. Cloudflare config/runtime checks.
-5. Optional claims/runbook scorecard pass for auditability.
+5. Investigation findings parity review (`investigation/findings/*.md`) for documented regressions.
 
 **Required feedback loop (non-gating)**
 - Run OTel trace checks for SQLite span family and connect/push `did_change` semantics.
@@ -209,8 +209,9 @@ Prove backport correctness and operational readiness.
 - SQLite-backed worker runtime behavior.
 - Cloudflare migration/wiring viability.
 
-**Claims framework usage**
-- Use claims artifacts as checklist support and reporting structure, not strict compliance mapping.
+**Findings-driven acceptance usage**
+- Use the investigation findings docs as the acceptance checklist and reporting structure.
+- Do not treat the legacy `investigation/claims` directory as an acceptance source.
 
 **Runtime/tooling assumption**
 - Use Node.js 20 for all installs/scripts/tests.

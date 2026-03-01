@@ -12,4 +12,4 @@ yarn workspace examples.tldraw.com e2e -- --project=chromium --workers=1
 # yarn e2e-dotcom -- --project=chromium --workers=1
 
 # Migration-focused runtime tests (optional but useful)
-# ./investigation/claims/run-claims.sh migrations
+# corepack yarn workspace @tldraw/sync-core test --runInBand src/test/InMemorySyncStorage.test.ts -t "migrateStorage"
