@@ -1,10 +1,15 @@
 #!/usr/bin/env sh
 . "$(dirname -- "$0")/_/husky.sh"
 
-yarn install --immutable
-npx lazy run build-api
-git add packages/*/api-report.api.md
-npx lazy run build-i18n
-git add apps/*/locales/*.json
-git add apps/*/locales-compiled/*.json
-yarn lint-staged
+set -e
+
+cleanup() {
+	./skills/tldraw-otel-lab/scripts/otel_lab.sh down >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM
+
+corepack yarn workspace @tldraw/sync test
+corepack yarn workspace @tldraw/sync-core test
+
+./skills/tldraw-otel-lab/scripts/otel_lab.sh up --fresh --no-worker
+corepack yarn workspace @tldraw/dotcom-worker e2e-simple
