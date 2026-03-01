@@ -26,7 +26,6 @@ new_classes = ["TldrawDurableObject"]
 # v2 was a no-op: classes_with_sqlite is not a valid Cloudflare migration directive
 [[migrations]]
 tag = "v2"
-classes_with_sqlite = ["TldrawDurableObject"]
 
 # New SQLite-backed class to replace KV-backed TldrawDurableObject
 [[migrations]]

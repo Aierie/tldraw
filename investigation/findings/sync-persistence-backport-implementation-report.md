@@ -40,5 +40,5 @@
    - Result: passing after sqlite DO class/binding/migration wiring backport.
 
 ## Notes
-1. `corepack yarn workspace tldraw-sync-cloudflare build` still reports a pre-existing client CSS resolution problem (`tldraw/tldraw.css`) unrelated to sqlite DO wiring, and wrangler warns that `classes_with_sqlite` is unexpected (kept intentionally as documented no-op migration history).
+1. `corepack yarn workspace tldraw-sync-cloudflare build` still reports a pre-existing client CSS resolution problem (`tldraw/tldraw.css`) unrelated to sqlite DO wiring.
 2. `git restore` in this repo currently triggers `.husky/post-checkout` noise and creates a transient `0` file; this was cleaned during validation and does not affect committed outputs.
