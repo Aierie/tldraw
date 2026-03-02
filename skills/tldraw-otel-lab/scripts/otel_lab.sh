@@ -206,13 +206,18 @@ start_worker() {
   log "Starting sync worker on http://127.0.0.1:$WORKER_PORT (logs: $WORKER_LOG_FILE)"
   (
     cd "$ROOT"
-    OTEL_ENABLED=true \
-    OTEL_CAPTURE_SPANS=true \
-    OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318/v1/traces \
-    OTEL_SERVICE_NAME=tldraw-sync-core-simple-worker \
-    OTEL_SAMPLE_RATIO=1 \
-    WORKER_ENV=development \
-      corepack yarn workspace @tldraw/dotcom-worker dev-simple
+    # Wrangler requires --var KEY:VALUE to inject Worker env bindings at runtime.
+    corepack yarn workspace @tldraw/dotcom-worker exec wrangler dev \
+      --config wrangler.simple.toml \
+      --local \
+      --log-level info \
+      --port "$WORKER_PORT" \
+      --var OTEL_ENABLED:true \
+      --var OTEL_CAPTURE_SPANS:true \
+      --var OTEL_EXPORTER_OTLP_ENDPOINT:http://127.0.0.1:4318/v1/traces \
+      --var OTEL_SERVICE_NAME:tldraw-sync-core-simple-worker \
+      --var OTEL_SAMPLE_RATIO:1 \
+      --var WORKER_ENV:development
   ) >"$WORKER_LOG_FILE" 2>&1 &
 
   local pid=$!

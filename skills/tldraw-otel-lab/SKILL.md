@@ -79,6 +79,7 @@ Use this when validating behavior changes in sync/OTel code paths.
 - If Jaeger receives spans but `traces.jsonl` stays empty, inspect collector logs for file-rotation errors:
   - `corepack yarn otel:logs | rg "can't rename log file|permission denied"`
 - If you see rename/permission errors, run `scripts/otel_lab.sh restart --no-worker` (or `up --fresh`) to reapply writable permissions and retry.
+- If worker/server spans are missing while client spans are present, verify the worker is started with Wrangler runtime vars using `--var KEY:VALUE` (colon syntax). `KEY=VALUE` passed to `--var` creates the wrong binding name and leaves `OTEL_ENABLED` false.
 
 ## Notes
 

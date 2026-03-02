@@ -81,16 +81,21 @@ export class ClientWebSocketAdapter implements TLPersistentClientSocket<TLRecord
 		didOpen?: boolean,
 		closeReason?: string
 	) {
+		const statusBefore = this.connectionStatus
 		withSyncSpan(
 			'tlsync.socket.client.disconnected',
 			{
 				attributes: {
+					'tldraw.socket.disconnect.reason': reason,
+					'tldraw.socket.close_code': closeCode ?? -1,
+					'tldraw.socket.did_open': !!didOpen,
+					'tldraw.socket.status_before': statusBefore,
 					'tlsync.close.code': closeCode ?? -1,
 					'tlsync.close.reason': closeReason ?? TLSyncErrorCloseEventReason.UNKNOWN_ERROR,
 					'tldraw.outcome': reason,
 				},
 			},
-			() => {
+			(span) => {
 				closeReason = closeReason || TLSyncErrorCloseEventReason.UNKNOWN_ERROR
 
 				debug('handleDisconnect', {
@@ -108,19 +113,20 @@ export class ClientWebSocketAdapter implements TLPersistentClientSocket<TLRecord
 							newStatus = 'offline'
 						}
 						break
-					case 'manual':
-						newStatus = 'offline'
-						break
-				}
+						case 'manual':
+							newStatus = 'offline'
+							break
+					}
+					span.setAttribute('tldraw.socket.status_after', newStatus)
 
-				if (closeCode === 1006 && !didOpen) {
-					warnOnce(
-						"Could not open WebSocket connection. This might be because you're trying to load a URL that doesn't support websockets. Check the URL you're trying to connect to."
-					)
-				}
+					if (closeCode === 1006 && !didOpen) {
+						warnOnce(
+							"Could not open WebSocket connection. This might be because you're trying to load a URL that doesn't support websockets. Check the URL you're trying to connect to."
+						)
+					}
 
 					if (
-						// it the status changed
+						// if the status changed
 						this.connectionStatus !== newStatus &&
 						// ignore errors if we're already in the offline state
 						!(newStatus === 'error' && this.connectionStatus === 'offline')
@@ -136,9 +142,9 @@ export class ClientWebSocketAdapter implements TLPersistentClientSocket<TLRecord
 						)
 					}
 
-				this._reconnectManager.disconnected()
-			}
-		)
+					this._reconnectManager.disconnected()
+				}
+			)
 	}
 
 	_setNewSocket(ws: WebSocket) {
@@ -227,10 +233,21 @@ export class ClientWebSocketAdapter implements TLPersistentClientSocket<TLRecord
 	_closeSocket() {
 		if (this._ws === null) return
 
-		this._ws.close()
-		// explicitly orphan the socket to ignore its onclose/onerror, because onclose can be delayed
-		this._ws = null
-		this._handleDisconnect('manual')
+		withSyncSpan(
+			'tlsync.socket.client.close_socket',
+			{
+				attributes: {
+					'tldraw.socket.ready_state': this._ws.readyState,
+					'tldraw.socket.status_before': this.connectionStatus,
+				},
+			},
+			() => {
+				this._ws?.close()
+				// explicitly orphan the socket to ignore its onclose/onerror, because onclose can be delayed
+				this._ws = null
+				this._handleDisconnect('manual')
+			}
+		)
 	}
 
 	// TLPersistentClientSocket stuff
@@ -300,8 +317,19 @@ export class ClientWebSocketAdapter implements TLPersistentClientSocket<TLRecord
 		assert(!this.isDisposed, 'Tried to restart a disposed socket')
 		debug('restarting')
 
-		this._closeSocket()
-		this._reconnectManager.maybeReconnected()
+		withSyncSpan(
+			'tlsync.socket.client.restart',
+			{
+				attributes: {
+					'tldraw.socket.status_before': this.connectionStatus,
+					'tldraw.socket.ready_state': this._ws?.readyState ?? -1,
+				},
+			},
+			() => {
+				this._closeSocket()
+				this._reconnectManager.maybeReconnected()
+			}
+		)
 	}
 }
 

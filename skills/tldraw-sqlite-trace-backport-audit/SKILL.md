@@ -37,8 +37,8 @@ Treat provenance as mandatory context before making behavioral claims.
    the same e2e spec also reads in-memory captured server spans via `GET /__test__/room/:roomId/spans` (not only collector output).
 5. Critical env caveat:
    `wrangler.simple.toml` defaults `OTEL_ENABLED="false"`.
-   If Playwright starts `dev-simple` itself, worker OTLP export may be off; client spans can still appear.
-   For full client+server/storage traces, pre-start worker with OTel env enabled (for example via `skills/tldraw-otel-lab/scripts/otel_lab.sh up --fresh`).
+   Worker OTLP export is only enabled when Wrangler runtime vars override this value (for example `--var OTEL_ENABLED:true --var OTEL_EXPORTER_OTLP_ENDPOINT:http://127.0.0.1:4318/v1/traces`).
+   For full client+server/storage traces, use the e2e config in this repo or pre-start with `skills/tldraw-otel-lab/scripts/otel_lab.sh up --fresh`.
 
 ## Workflow
 
