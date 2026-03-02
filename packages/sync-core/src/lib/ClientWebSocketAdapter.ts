@@ -119,21 +119,22 @@ export class ClientWebSocketAdapter implements TLPersistentClientSocket<TLRecord
 					)
 				}
 
-				if (
-					// it the status changed
-					this.connectionStatus !== newStatus &&
-					// ignore errors if we're already in the offline state
-					!(newStatus === 'error' && this.connectionStatus === 'offline')
-				) {
-					this._connectionStatus.set(newStatus)
-					this.statusListeners.forEach((cb) =>
-						cb(
-							newStatus === 'error'
-								? { status: 'error', reason: closeReason }
-								: { status: newStatus }
+					if (
+						// it the status changed
+						this.connectionStatus !== newStatus &&
+						// ignore errors if we're already in the offline state
+						!(newStatus === 'error' && this.connectionStatus === 'offline')
+					) {
+						this._connectionStatus.set(newStatus)
+						const normalizedCloseReason = closeReason ?? TLSyncErrorCloseEventReason.UNKNOWN_ERROR
+						this.statusListeners.forEach((cb) =>
+							cb(
+								newStatus === 'error'
+									? { status: 'error', reason: normalizedCloseReason }
+									: { status: newStatus }
+							)
 						)
-					)
-				}
+					}
 
 				this._reconnectManager.disconnected()
 			}

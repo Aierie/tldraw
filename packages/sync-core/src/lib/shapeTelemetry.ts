@@ -105,9 +105,10 @@ export function summarizeShapeHierarchyFromNetworkDiff<R extends UnknownRecord>(
 	for (const [id, op] of Object.entries(diff)) {
 		switch (op[0]) {
 			case RecordOpType.Put: {
-				if (!isShapeRecord(op[1])) break
+				const record = op[1] as unknown
+				if (!isShapeRecord(record)) break
 				shapePuts++
-				switch (getShapeParentKind(op[1].parentId)) {
+				switch (getShapeParentKind(record.parentId)) {
 					case 'shape':
 						parentShape++
 						break

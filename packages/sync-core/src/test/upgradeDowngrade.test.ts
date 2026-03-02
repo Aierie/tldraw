@@ -332,7 +332,7 @@ test('clients will receive updates from a snapshot migration upon connection', (
 	newServer.room.handleMessage(id, {
 		type: 'connect',
 		connectRequestId: 'test',
-		lastServerClock: snapshot.clock,
+		lastServerClock: snapshot.clock!,
 		protocolVersion: getTlsyncProtocolVersion(),
 		schema: schemaV3.serialize(),
 	})

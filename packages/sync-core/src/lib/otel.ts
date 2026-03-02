@@ -91,16 +91,16 @@ export function getSyncTraceAttributes(ctx: Context = context.active()): Record<
 	return attrs
 }
 
-export function attachTraceCarrier<T extends { trace?: TLTraceCarrier }>(
+export function attachTraceCarrier<T extends object>(
 	message: T,
 	ctx: Context = context.active()
 ): T {
 	const carrier = getTraceCarrierForContext(ctx)
 	if (!carrier) return message
 	return {
-		...message,
+		...(message as object),
 		trace: carrier,
-	}
+	} as T
 }
 
 export function extractTraceContext(traceCarrier?: TLTraceCarrier): Context {
@@ -125,14 +125,14 @@ export function withSyncSpan<T>(
 				'then' in result &&
 				typeof result.then === 'function'
 			) {
-				return (result as Promise<unknown>)
+				return Promise.resolve(result as unknown as Promise<unknown>)
 					.catch((error) => {
 						recordSpanError(span, error)
 						throw error
 					})
 					.finally(() => {
 						span.end()
-					}) as T
+					}) as unknown as T
 			}
 			span.end()
 			return result
@@ -164,12 +164,13 @@ export function setSafeAttributes(span: Span, attributes: Attributes | Record<st
 			continue
 		}
 		if (Array.isArray(value)) {
+			const filtered = value.filter(
+				(item): item is string | number | boolean =>
+					typeof item === 'string' || typeof item === 'number' || typeof item === 'boolean'
+			)
 			span.setAttribute(
 				key,
-				value.filter(
-					(item): item is string | number | boolean =>
-						typeof item === 'string' || typeof item === 'number' || typeof item === 'boolean'
-				)
+				filtered as unknown as Parameters<Span['setAttribute']>[1]
 			)
 		}
 	}

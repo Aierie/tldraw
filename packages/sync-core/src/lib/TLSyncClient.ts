@@ -97,6 +97,8 @@ export type TlSocketStatusChangeEvent =
 			reason: string
 	  }
 /** @internal */
+export type TLSocketStatusChangeEvent = TlSocketStatusChangeEvent
+/** @internal */
 export type TLSocketStatusListener = (params: TlSocketStatusChangeEvent) => void
 
 /** @internal */
