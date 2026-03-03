@@ -16,6 +16,7 @@ import {
 } from '@tldraw/utils'
 import { NetworkDiff, RecordOpType, applyObjectDiff, diffRecord, getNetworkDiff } from './diff'
 import { interval } from './interval'
+import { setSafeAttributes, withSyncSpan } from './otel'
 import {
 	TLPushRequest,
 	TLSocketClientSentEvent,
@@ -104,6 +105,60 @@ export interface TLPersistentClientSocket<R extends UnknownRecord = UnknownRecor
 
 const PING_INTERVAL = 5000
 const MAX_TIME_TO_WAIT_FOR_SERVER_INTERACTION_BEFORE_RESETTING_CONNECTION = PING_INTERVAL * 2
+
+type ResetConnectionCause =
+	| 'socket_status_offline'
+	| 'socket_status_error'
+	| 'ping_send_error'
+	| 'health_check_timeout'
+	| 'did_reconnect_while_connected'
+	| 'did_reconnect_with_pending_pushes'
+	| 'rebase_replay_error'
+	| 'rebase_error'
+	| 'unknown'
+
+function summarizeUnknownError(error: unknown) {
+	if (error instanceof Error) {
+		const stackTop =
+			error.stack
+				?.split('\n')
+				.map((line) => line.trim())
+				.find((line) => line.startsWith('at ')) ?? ''
+		return {
+			kind: 'Error',
+			name: error.name || 'Error',
+			message: error.message || '(empty)',
+			stackTop,
+		}
+	}
+	if (Array.isArray(error)) {
+		let preview = '(empty)'
+		if (error.length > 0) {
+			const first = error[0]
+			if (typeof first === 'string') {
+				preview = first
+			} else {
+				try {
+					preview = JSON.stringify(first).slice(0, 400)
+				} catch {
+					preview = String(first)
+				}
+			}
+		}
+		return {
+			kind: 'Array',
+			name: 'Array',
+			message: `length=${error.length}; first=${preview}`,
+			stackTop: '',
+		}
+	}
+	return {
+		kind: typeof error,
+		name: 'NonError',
+		message: String(error),
+		stackTop: '',
+	}
+}
 
 // Should connect support chunking the response to allow for large payloads?
 
@@ -228,13 +283,13 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 				this.debug('socket status changed', ev.status)
 				if (ev.status === 'online') {
 					this.sendConnectMessage()
+				} else if (ev.status === 'error') {
+					this.resetConnection(false, 'socket_status_error')
+					didLoad = true
+					config.onSyncError(ev.reason)
+					this.close()
 				} else {
-					this.resetConnection()
-					if (ev.status === 'error') {
-						didLoad = true
-						config.onSyncError(ev.reason)
-						this.close()
-					}
+					this.resetConnection(false, 'socket_status_offline')
 				}
 			}),
 			// Send a ping every PING_INTERVAL ms while online
@@ -246,7 +301,7 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 					this.socket.sendMessage({ type: 'ping' })
 				} catch (error) {
 					console.warn('ping failed, resetting', error)
-					this.resetConnection()
+					this.resetConnection(false, 'ping_send_error')
 				}
 			}, PING_INTERVAL),
 			// Check the server connection health, reset the connection if needed
@@ -266,7 +321,7 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 				}
 
 				console.warn(`Haven't heard from the server in a while, resetting connection...`)
-				this.resetConnection()
+				this.resetConnection(false, 'health_check_timeout')
 			}, PING_INTERVAL * 2)
 		)
 
@@ -309,25 +364,52 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 	}
 
 	/** Switch to offline mode */
-	private resetConnection(hard = false) {
-		this.debug('resetting connection')
-		if (hard) {
-			this.lastServerClock = 0
-		}
-		// kill all presence state
-		const keys = Object.keys(this.store.serialize('presence')) as any
-		if (keys.length > 0) {
-			this.store.mergeRemoteChanges(() => {
-				this.store.remove(keys)
-			})
-		}
-		this.lastPushedPresenceState = null
-		this.isConnectedToRoom = false
-		this.pendingPushRequests = []
-		this.incomingDiffBuffer = []
-		if (this.socket.connectionStatus === 'online') {
-			this.socket.restart()
-		}
+	private resetConnection(hard = false, cause: ResetConnectionCause = 'unknown') {
+		withSyncSpan(
+			'tlsync.client.reset_connection',
+			{
+				attributes: {
+					'tldraw.client.reset.hard': hard,
+					'tldraw.client.reset.reason': cause,
+					'tldraw.client.pending_pushes': this.pendingPushRequests.length,
+					'tldraw.client.pending_incoming_diffs': this.incomingDiffBuffer.length,
+					'tldraw.client.speculative.added': Object.keys(this.speculativeChanges.added).length,
+					'tldraw.client.speculative.updated': Object.keys(this.speculativeChanges.updated).length,
+					'tldraw.client.speculative.removed': Object.keys(this.speculativeChanges.removed).length,
+					'tldraw.client.is_connected_to_room': this.isConnectedToRoom,
+					'tldraw.client.last_server_clock': this.lastServerClock,
+					'tldraw.client.last_server_interaction_ms':
+						Date.now() - this.lastServerInteractionTimestamp,
+					'tldraw.socket.status': this.socket.connectionStatus,
+					'tldraw.outcome': hard ? 'hard' : 'soft',
+				},
+			},
+			(span) => {
+				this.debug('resetting connection')
+				const shouldRestartSocket = this.socket.connectionStatus === 'online'
+				if (hard) {
+					this.lastServerClock = 0
+				}
+				// kill all presence state
+				const keys = Object.keys(this.store.serialize('presence')) as any
+				setSafeAttributes(span, {
+					'tldraw.client.presence_record_count': keys.length,
+					'tldraw.client.will_restart_socket': shouldRestartSocket,
+				})
+				if (keys.length > 0) {
+					this.store.mergeRemoteChanges(() => {
+						this.store.remove(keys)
+					})
+				}
+				this.lastPushedPresenceState = null
+				this.isConnectedToRoom = false
+				this.pendingPushRequests = []
+				this.incomingDiffBuffer = []
+				if (shouldRestartSocket) {
+					this.socket.restart()
+				}
+			}
+		)
 	}
 
 	/**
@@ -345,12 +427,12 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 
 		if (this.isConnectedToRoom) {
 			console.error('didReconnect called while already connected')
-			this.resetConnection(true)
+			this.resetConnection(true, 'did_reconnect_while_connected')
 			return
 		}
 		if (this.pendingPushRequests.length > 0) {
 			console.error('pendingPushRequests should already be empty when we reconnect')
-			this.resetConnection(true)
+			this.resetConnection(true, 'did_reconnect_with_pending_pushes')
 			return
 		}
 		// at the end of this process we want to have at most one pending push request
@@ -599,67 +681,110 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 
 	// eslint-disable-next-line local/prefer-class-methods
 	private rebase = () => {
-		// need to make sure that our speculative changes are in sync with the actual store instance before
-		// proceeding, to avoid inconsistency bugs.
-		this.store._flushHistory()
-		if (this.incomingDiffBuffer.length === 0) return
+		return withSyncSpan(
+			'tlsync.client.rebase',
+			{
+				attributes: {
+					'tldraw.client.pending_incoming_diffs': this.incomingDiffBuffer.length,
+					'tldraw.client.pending_pushes': this.pendingPushRequests.length,
+				},
+			},
+			(span) => {
+				// need to make sure that our speculative changes are in sync with the actual store instance before
+				// proceeding, to avoid inconsistency bugs.
+				this.store._flushHistory()
+				if (this.incomingDiffBuffer.length === 0) return
 
-		const diffs = this.incomingDiffBuffer
-		this.incomingDiffBuffer = []
+				const diffs = this.incomingDiffBuffer
+				this.incomingDiffBuffer = []
+				let pushResultCommits = 0
+				let pushResultDiscards = 0
+				let pushResultRebases = 0
+				let patchEvents = 0
 
-		try {
-			this.store.mergeRemoteChanges(() => {
-				// first undo speculative changes
-				this.store.applyDiff(reverseRecordsDiff(this.speculativeChanges), { runCallbacks: false })
-
-				// then apply network diffs on top of known-to-be-synced data
-				for (const diff of diffs) {
-					if (diff.type === 'patch') {
-						this.applyNetworkDiff(diff.diff, true)
-						continue
-					}
-					// handling push_result
-					if (this.pendingPushRequests.length === 0) {
-						throw new Error('Received push_result but there are no pending push requests')
-					}
-					if (this.pendingPushRequests[0].request.clientClock !== diff.clientClock) {
-						throw new Error(
-							'Received push_result for a push request that is not at the front of the queue'
-						)
-					}
-					if (diff.action === 'discard') {
-						this.pendingPushRequests.shift()
-					} else if (diff.action === 'commit') {
-						const { request } = this.pendingPushRequests.shift()!
-						if ('diff' in request && request.diff) {
-							this.applyNetworkDiff(request.diff, true)
-						}
-					} else {
-						this.applyNetworkDiff(diff.action.rebaseWithDiff, true)
-						this.pendingPushRequests.shift()
-					}
-				}
-				// update the speculative diff while re-applying pending changes
 				try {
-					this.speculativeChanges = this.store.extractingChanges(() => {
-						for (const { request } of this.pendingPushRequests) {
-							if (!('diff' in request) || !request.diff) continue
-							this.applyNetworkDiff(request.diff, true)
+					this.store.mergeRemoteChanges(() => {
+						// first undo speculative changes
+						this.store.applyDiff(reverseRecordsDiff(this.speculativeChanges), {
+							runCallbacks: false,
+						})
+
+						// then apply network diffs on top of known-to-be-synced data
+						for (const diff of diffs) {
+							if (diff.type === 'patch') {
+								patchEvents++
+								this.applyNetworkDiff(diff.diff, true)
+								continue
+							}
+							// handling push_result
+							if (this.pendingPushRequests.length === 0) {
+								throw new Error('Received push_result but there are no pending push requests')
+							}
+							if (this.pendingPushRequests[0].request.clientClock !== diff.clientClock) {
+								throw new Error(
+									'Received push_result for a push request that is not at the front of the queue'
+								)
+							}
+							if (diff.action === 'discard') {
+								pushResultDiscards++
+								this.pendingPushRequests.shift()
+							} else if (diff.action === 'commit') {
+								pushResultCommits++
+								const { request } = this.pendingPushRequests.shift()!
+								if ('diff' in request && request.diff) {
+									this.applyNetworkDiff(request.diff, true)
+								}
+							} else {
+								pushResultRebases++
+								this.applyNetworkDiff(diff.action.rebaseWithDiff, true)
+								this.pendingPushRequests.shift()
+							}
+						}
+						// update the speculative diff while re-applying pending changes
+						try {
+							this.speculativeChanges = this.store.extractingChanges(() => {
+								for (const { request } of this.pendingPushRequests) {
+									if (!('diff' in request) || !request.diff) continue
+									this.applyNetworkDiff(request.diff, true)
+								}
+							})
+						} catch (e) {
+							console.error(e)
+							// throw away the speculative changes and start over
+							this.speculativeChanges = { added: {} as any, updated: {} as any, removed: {} as any }
+							const err = summarizeUnknownError(e)
+							setSafeAttributes(span, {
+								'tldraw.client.rebase.error.kind': err.kind,
+								'tldraw.client.rebase.error.name': err.name,
+								'tldraw.client.rebase.error.message': err.message,
+								'tldraw.client.rebase.error.stack_top': err.stackTop,
+							})
+							this.resetConnection(false, 'rebase_replay_error')
 						}
 					})
+					this.lastServerClock = diffs.at(-1)?.serverClock ?? this.lastServerClock
 				} catch (e) {
 					console.error(e)
-					// throw away the speculative changes and start over
-					this.speculativeChanges = { added: {} as any, updated: {} as any, removed: {} as any }
-					this.resetConnection()
+					const err = summarizeUnknownError(e)
+					setSafeAttributes(span, {
+						'tldraw.client.rebase.error.kind': err.kind,
+						'tldraw.client.rebase.error.name': err.name,
+						'tldraw.client.rebase.error.message': err.message,
+						'tldraw.client.rebase.error.stack_top': err.stackTop,
+					})
+					this.store.ensureStoreIsUsable()
+					this.resetConnection(false, 'rebase_error')
+				} finally {
+					setSafeAttributes(span, {
+						'tldraw.client.rebase.events': diffs.length,
+						'tldraw.client.rebase.patch_events': patchEvents,
+						'tldraw.client.rebase.push_result.commit': pushResultCommits,
+						'tldraw.client.rebase.push_result.discard': pushResultDiscards,
+						'tldraw.client.rebase.push_result.rebase': pushResultRebases,
+					})
 				}
-			})
-			this.lastServerClock = diffs.at(-1)?.serverClock ?? this.lastServerClock
-		} catch (e) {
-			console.error(e)
-			this.store.ensureStoreIsUsable()
-			this.resetConnection()
-		}
+			}
+		)
 	}
 
 	private scheduleRebase = fpsThrottle(this.rebase)

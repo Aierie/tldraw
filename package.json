@@ -67,6 +67,8 @@
 		"e2e": "lazy e2e --filter='apps/examples'",
 		"e2e-dotcom": "lazy e2e --filter='apps/dotcom/*'",
 		"e2e-dotcom-x10": "lazy e2e-x10 --filter='apps/dotcom/*'",
+		"otel:up": "docker compose -f internal/observability/otel/docker-compose.yml up -d",
+		"otel:down": "docker compose -f internal/observability/otel/docker-compose.yml down",
 		"i18n-check": "i18n-check",
 		"i18n-upload-strings": "tsx internal/scripts/i18n-upload-strings.ts",
 		"i18n-download-strings": "tsx internal/scripts/i18n-download-strings.ts"

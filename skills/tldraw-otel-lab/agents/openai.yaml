@@ -1,0 +1,4 @@
+interface:
+  display_name: "tldraw OTel Lab"
+  short_description: "Run and clean up local OTel tracing sessions with stale-service checks."
+  default_prompt: "Start, verify, and tear down the local tldraw OTel stack (collector, Jaeger, sync worker), including stale-process detection, trace reset, and health checks."
