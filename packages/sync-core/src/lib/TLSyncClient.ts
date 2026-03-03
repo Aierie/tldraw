@@ -209,7 +209,7 @@ interface PendingPushRequestState<R extends UnknownRecord> {
  */
 export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>> {
 	/** The last clock time from the most recent server update */
-	private lastServerClock = 0
+	private lastServerClock = -1
 	private lastServerInteractionTimestamp = Date.now()
 
 	/** The queue of in-flight push requests that have not yet been acknowledged by the server */
@@ -500,7 +500,7 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 				this.debug('resetting connection')
 				const shouldRestartSocket = this.socket.connectionStatus === 'online'
 				if (hard) {
-					this.lastServerClock = 0
+					this.lastServerClock = -1
 				}
 				// kill all presence state
 				const keys = Object.keys(this.store.serialize('presence')) as any
@@ -990,7 +990,10 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 									})
 									this.resetConnection(false, 'rebase_replay_error')
 								}
-							})
+
+							// Keep document/session invariants valid before remote callbacks flush.
+							// this.store.ensureStoreIsUsable()
+						})
 						this.lastServerClock = diffs.at(-1)?.serverClock ?? this.lastServerClock
 					} catch (e) {
 						console.error(e)
@@ -1001,7 +1004,7 @@ export class TLSyncClient<R extends UnknownRecord, S extends Store<R> = Store<R>
 								'tldraw.client.rebase.error.message': err.message,
 								'tldraw.client.rebase.error.stack_top': err.stackTop,
 							})
-							this.store.ensureStoreIsUsable()
+							// this.store.ensureStoreIsUsable()
 							this.resetConnection(false, 'rebase_error')
 						} finally {
 						setSafeAttributes(span, {
