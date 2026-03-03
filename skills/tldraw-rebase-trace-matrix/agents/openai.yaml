@@ -1,0 +1,4 @@
+interface:
+  display_name: "tldraw Rebase Trace Matrix"
+  short_description: "Analyze rebase camera-null regressions from OTel traces."
+  default_prompt: "Run a TLSyncClient clock/ensureStoreIsUsable matrix in tldraw-3, generate fresh traces, and summarize rebase errors, push outcomes, and hydration signals."
