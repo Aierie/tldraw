@@ -708,6 +708,139 @@ test.describe('simple sync worker e2e', () => {
 		expect(traceSpanNames.some((name) => name === 'tlsync.client.store_changes')).toBeTruthy()
 	})
 
+	test('regression: rebase should not enter camera-null state', async ({ page }, testInfo) => {
+		const collectorReachable = await isCollectorReachable()
+		expect(
+			collectorReachable,
+			'OTel collector is not reachable at http://127.0.0.1:4318. Start it with ./skills/tldraw-otel-lab/scripts/otel_lab.sh up --fresh from the repo root.'
+		).toBe(true)
+
+		const roomId = buildRoomId(testInfo)
+		const shapeAId = 'shape:rebase-regression-a'
+		const shapeBId = 'shape:rebase-regression-b'
+		const shapeCId = 'shape:rebase-regression-c'
+		const groupId = 'shape:rebase-regression-group'
+		const otelTraceCapture = await startOtelTraceCapture(testInfo)
+
+		await resetRoom(roomId)
+		await clearSpans(roomId)
+		await openRoom(page, roomId)
+		await waitForConnect(roomId)
+
+		await runCanvasOps(page, [
+			{
+				kind: 'create',
+				shapes: [
+					{
+						id: shapeAId,
+						type: 'geo',
+						x: 120,
+						y: 100,
+						props: { geo: 'rectangle', w: 180, h: 120 },
+					},
+					{
+						id: shapeBId,
+						type: 'geo',
+						x: 360,
+						y: 120,
+						props: { geo: 'rectangle', w: 180, h: 120 },
+					},
+					{
+						id: shapeCId,
+						type: 'geo',
+						x: 620,
+						y: 140,
+						props: { geo: 'rectangle', w: 180, h: 120 },
+					},
+				],
+			},
+		])
+
+		await waitForSnapshot(roomId, (next) => {
+			return Boolean(
+				getSnapshotRecord(next, shapeAId) &&
+					getSnapshotRecord(next, shapeBId) &&
+					getSnapshotRecord(next, shapeCId)
+			)
+		})
+
+		await runCanvasOps(page, [
+			{
+				kind: 'update',
+				shapes: [
+					{
+						id: shapeAId,
+						type: 'geo',
+						x: 220,
+						y: 220,
+						props: { w: 220, h: 140 },
+					},
+				],
+			},
+		])
+
+		await waitForSnapshot(roomId, (next) => {
+			const shape = getSnapshotRecord(next, shapeAId)
+			return shape?.x === 220 && shape?.y === 220
+		})
+
+		await runCanvasOps(page, [
+			{ kind: 'group', ids: [shapeAId, shapeBId], groupId },
+			{ kind: 'reparent', ids: [shapeCId], parentId: groupId },
+		])
+
+		await waitForSnapshot(roomId, (next) => {
+			const group = getSnapshotRecord(next, groupId)
+			const shapeA = getSnapshotRecord(next, shapeAId)
+			const shapeB = getSnapshotRecord(next, shapeBId)
+			const shapeC = getSnapshotRecord(next, shapeCId)
+			return (
+				group?.type === 'group' &&
+				shapeA?.parentId === groupId &&
+				shapeB?.parentId === groupId &&
+				shapeC?.parentId === groupId
+			)
+		})
+
+		await runCanvasOps(page, [{ kind: 'delete', ids: [shapeBId] }])
+		await waitForSnapshot(roomId, (next) => !getSnapshotRecord(next, shapeBId))
+		await runCanvasOps(page, [{ kind: 'delete', ids: [groupId] }])
+		await waitForSnapshot(roomId, (next) => {
+			return (
+				!getSnapshotRecord(next, groupId) &&
+				!getSnapshotRecord(next, shapeAId) &&
+				!getSnapshotRecord(next, shapeCId)
+			)
+		})
+
+		await flushOtel(page, roomId)
+
+		const detailedTraceSpans = await waitForTraceSpanDetails(
+			otelTraceCapture,
+			(spans) => spans.filter((span) => span.name === 'tlsync.client.push').length >= 3,
+			20_000
+		)
+
+		const rebaseErrorMessages = detailedTraceSpans
+			.filter((span) => span.name === 'tlsync.client.rebase')
+			.map((span) => span.attributes['tldraw.client.rebase.error.message'])
+			.filter((message): message is string => typeof message === 'string')
+
+		const resetReasons = detailedTraceSpans
+			.filter((span) => span.name === 'tlsync.client.reset_connection')
+			.map((span) => span.attributes['tldraw.client.reset.reason'])
+			.filter((reason): reason is string => typeof reason === 'string')
+
+		expect(
+			rebaseErrorMessages,
+			`Expected no rebase camera errors, got: ${rebaseErrorMessages.join(' | ')}`
+		).toEqual([])
+		expect(
+			resetReasons.filter((reason) => reason === 'rebase_error'),
+			`Expected no rebase_error resets, got: ${resetReasons.join(' | ')}`
+		).toEqual([])
+	})
+
 	test('essential canvas ops via DOM interaction write to OTel traces (create/move/delete)', async ({
 		page,
 	}, testInfo) => {
