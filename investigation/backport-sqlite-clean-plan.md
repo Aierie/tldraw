@@ -191,3 +191,76 @@ Optional template validation:
 3. Migration safety regressions are covered and passing.
 4. Client/server connect-push behavior remains compatible with `v3.15.x` expectations.
 5. Optional Cloudflare template track is either completed and validated or explicitly deferred.
+
+## Minimal Delta Manifest (Oracle Addendum)
+
+This is the smallest practical implementation set to achieve the objective without importing observability-era coupling.
+
+1. Backport store migration substrate from `89ecb2882` with `5221da51b` safety behavior preserved:
+   - `packages/store/src/lib/migrate.ts`
+   - `packages/store/src/lib/StoreSchema.ts`
+   - `packages/store/src/index.ts`
+   - Keep staged writes in `migrateStorage(...)` for record-scope migrations.
+2. Backport sync storage primitives from `89ecb2882`, but use span-free logic only:
+   - `packages/sync-core/src/lib/TLSyncStorage.ts`
+   - `packages/sync-core/src/lib/InMemorySyncStorage.ts`
+   - `packages/sync-core/src/lib/SQLiteSyncStorage.ts`
+   - `packages/sync-core/src/lib/NodeSqliteWrapper.ts`
+   - `packages/sync-core/src/lib/DurableObjectSqliteSyncWrapper.ts`
+   - `packages/sync-core/src/lib/MicrotaskNotifier.ts`
+   - `packages/sync-core/src/lib/recordDiff.ts`
+   - `packages/sync-core/src/lib/diff.ts`
+   - `packages/sync-core/src/index.ts`
+3. Integrate storage transaction model into room/socket paths, then apply compatibility correctness patch:
+   - `packages/sync-core/src/lib/TLSyncRoom.ts`
+   - `packages/sync-core/src/lib/TLSocketRoom.ts`
+   - `packages/sync-core/src/lib/RoomSession.ts`
+   - Apply `f3bfadd06` (`updateStore`/`getAll()` includes puts-only new records).
+4. Apply client clock safety semantics from `4b45869dc` exactly as scoped in this plan:
+   - `packages/sync-core/src/lib/TLSyncClient.ts`
+   - Keep `lastServerClock` initialization and hard reset at `-1`.
+5. Backport regression coverage from `6774bd059` + `3fa9cdc96`:
+   - `packages/store/src/lib/test/recordStore.test.ts`
+   - `packages/sync-core/src/test/InMemorySyncStorage.test.ts`
+   - `packages/sync-core/src/test/SQLiteSyncStorage.test.ts`
+   - `packages/sync-core/src/lib/NodeSqliteSyncWrapper.integration.test.ts`
+   - `packages/sync-core/src/test/TLSyncRoom.test.ts`
+6. Optional template track:
+   - Apply `78b52991a`, `a2eafe83f`, `dffa84446` intent, but account for later `main` fix `2d6554e2c`.
+   - Practical caveat: Cloudflare can reject deleting previously bound DO classes; if deploy validation fails on `deleted_classes`, prefer leaving old class undeleted while still using `new_sqlite_classes` for new runtime binding.
+
+## Preflight Gate (Run Before Each Backport Commit)
+
+Use this mechanical gate to prevent drift and catch accidental observability/protocol contamination early.
+
+```bash
+# 0) Safety: review scope of staged changes
+git status --short
+
+# 1) OTel/trace token scan in touched subsystems (must be empty for new backport code)
+rg -n "@opentelemetry/api|withSyncSpan|extractTraceContext|traceparent|tracestate|baggage" \
+  packages/store packages/sync-core templates/sync-cloudflare
+
+# 2) Protocol trace-carrier guard (must not add trace fields vs v3.15.x)
+git diff -- packages/sync-core/src/lib/protocol.ts
+
+# 3) OTel dependency guard (must not add @opentelemetry/api vs v3.15.x)
+git diff -- packages/sync-core/package.json
+
+# 4) Ensure forbidden observability files are untouched
+git diff -- apps/dotcom/sync-worker/src '*otel*' internal/observability
+
+# 5) Ensure migration safety pattern remains in place
+rg -n "const updates: \[string, R\]\[\]|for \(const \[id, state\] of storage\.entries\(\)\)" \
+  packages/store/src/lib/StoreSchema.ts
+
+# 6) Ensure clock fix semantics are present
+rg -n "lastServerClock = -1|this\.lastServerClock = -1" \
+  packages/sync-core/src/lib/TLSyncClient.ts
+```
+
+Expected interpretation:
+
+1. Step 1 should return no newly introduced hits in backported files.
+2. Steps 2-4 should show no disallowed diffs against the hard constraints.
+3. Steps 5-6 should positively confirm required regression-prevention logic exists.
